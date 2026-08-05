@@ -1,0 +1,206 @@
+import socket
+import os
+import pty
+import tty
+import termios
+import select
+from telnet_serv.get_ip import get_local_ip
+    
+# Задаём секретный код доступа
+ACCESS_CODE = os.getenv('TELNET_ACCESS', '').strip()
+
+# print(ACCESS_CODE)
+# Константы Telnet
+IAC  = b'\xff'
+WILL = b'\xfb'
+WONT = b'\xfc'
+DO   = b'\xfd'
+DONT = b'\xfe'
+ECHO = b'\x01'
+
+def handle_telnet_negotiation(conn, data):
+    """Обрабатывает Telnet-команды от клиента"""
+    i = 0
+    while i < len(data):
+        if data[i] == 255:  # IAC
+            if i + 2 < len(data):
+                cmd = data[i+1]
+                opt = data[i+2]
+                print(f"[Telnet] Получено: {cmd} {opt}")
+                
+                # Отвечаем на запросы клиента
+                if cmd == DO[0] and opt == ECHO[0]:
+                    # Клиент согласен, что мы будем отправлять эхо
+                    pass
+                elif cmd == DONT[0] and opt == ECHO[0]:
+                    # Клиент отказывается
+                    pass
+                    
+                i += 3
+                continue
+        i += 1
+    
+    # Возвращаем только "чистые" данные (без Telnet-команд)
+    # Пропускаем все IAC-последовательности
+    clean = bytearray()
+    i = 0
+    while i < len(data):
+        if data[i] == 255 and i + 2 < len(data):
+            i += 3
+        else:
+            clean.append(data[i])
+            i += 1
+    
+    return bytes(clean)
+
+# def authenticate(conn):
+    # 1. Говорим клиенту: "Я буду отправлять эхо"
+    conn.send(IAC + WILL + ECHO)
+    
+    # Даём время клиенту ответить (читаем его ответ)
+    conn.settimeout(0.5)
+    try:
+        resp = conn.recv(1024)
+        if resp:
+            handle_telnet_negotiation(conn, resp)
+    except socket.timeout:
+        pass
+    conn.settimeout(None)
+    
+    # Отправляем приглашение
+    conn.send(b"Access code: ")
+    
+    # Читаем пароль (клиент не показывает его, так как ждёт эхо от нас, а мы не шлём)
+    data = conn.recv(1024)
+    if not data:
+        return False
+    
+    # Очищаем от Telnet-команд
+    clean_data = handle_telnet_negotiation(conn, data)
+    
+    # 2. Говорим клиенту: "Я больше не буду отправлять эхо, включай своё"
+    conn.send(IAC + WONT + ECHO)
+    
+    # Переводим строку
+    conn.send(b"\r\n")
+    
+    received = clean_data.decode('utf-8', errors='ignore')
+    print(received.strip(), len(received.strip()))
+    print(ACCESS_CODE.strip(), len(ACCESS_CODE.strip()))
+    if received.strip() == ACCESS_CODE.strip():
+        conn.send(b"Access granted. Starting shell...\r\n\n")
+        return True
+    else:
+        conn.send(b"Access denied.\r\n")
+        return False
+
+
+def authenticate(conn):
+    # 1. Говорим клиенту: "Я буду отправлять эхо"
+    conn.send(IAC + WILL + ECHO)
+    
+    # Даём время клиенту ответить
+    conn.settimeout(0.5)
+    try:
+        resp = conn.recv(1024)
+        if resp:
+            handle_telnet_negotiation(conn, resp)  # Обработаем, но не используем результат здесь
+    except socket.timeout:
+        pass  # Игнорируем, если нет ответа
+    conn.settimeout(None)  # Снимаем таймаут
+    
+    # Отправляем приглашение
+    conn.send(b"Access code: ")
+    
+    # Читаем пароль
+    data = conn.recv(1024)
+    if not data:
+        return False
+    
+    # Очищаем от Telnet-команд
+    clean_data = handle_telnet_negotiation(conn, data)
+    
+    # 2. Декодируем данные с лучшей обработкой ошибок
+    try:
+        received = clean_data.decode('utf-8').rstrip('\r\n').strip()  # Удаляем \r\n и пробелы
+    except UnicodeDecodeError as e:
+        print(f"Ошибка декодирования: {e}")
+        received = ""  # Если декодирование失败, используем пустую строку
+    
+    # 3. Говорим клиенту: "Я больше не буду отправлять эхо"
+    conn.send(IAC + WONT + ECHO)
+    
+    # Переводим строку
+    conn.send(b"\r\n")
+
+    # Сравнение: Добавляем регистронезависимое сравнение, если нужно
+    if received.lower() == ACCESS_CODE.strip().lower():  # .lower() для игнорирования регистра
+        conn.send(b"Access granted. Starting shell...\r\n\n")
+        return True
+    else:
+        conn.send(b"Access denied.\r\n")
+        return False
+def handle_client(conn):
+    if not authenticate(conn):
+        conn.close()
+        return
+
+    master_fd, slave_fd = pty.openpty()
+    tty.setraw(master_fd)
+    
+    pid = os.fork()
+    if pid == 0:
+        os.close(master_fd)
+        os.setsid()
+        os.dup2(slave_fd, 0)
+        os.dup2(slave_fd, 1)
+        os.dup2(slave_fd, 2)
+        shell = os.environ.get('SHELL', '/bin/sh')
+        os.execl(shell, shell)
+    else:
+        os.close(slave_fd)
+        try:
+            while True:
+                rlist, _, _ = select.select([conn, master_fd], [], [])
+                
+                if conn in rlist:
+                    data = conn.recv(1024)
+                    if not data:
+                        break
+                    clean = handle_telnet_negotiation(conn, data)
+                    if clean:
+                        os.write(master_fd, clean)
+                    
+                if master_fd in rlist:
+                    data = os.read(master_fd, 1024)
+                    if not data:
+                        break
+                    conn.send(data)
+        except Exception as e:
+            print(f"Ошибка: {e}")
+        finally:
+            os.close(master_fd)
+            conn.close()
+            os.waitpid(pid, 0)
+
+def start_server(host='0.0.0.0', port=4022):
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((host, port))
+    server_socket.listen(5)
+    print(f"Сервер запущен на {host}:{port}")
+
+    try:
+        while True:
+            conn, addr = server_socket.accept()
+            print(f"Подключение от {addr}")
+            handle_client(conn)
+    except KeyboardInterrupt:
+        print("\nСервер остановлен.")
+    finally:
+        server_socket.close()
+
+if __name__ == "__main__":
+    telnet_port = 4022
+    ip_adress = get_local_ip()
+    start_server(host=ip_adress, port=telnet_port)
