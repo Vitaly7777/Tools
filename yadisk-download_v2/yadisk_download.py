@@ -16,6 +16,18 @@ import time
 API = "https://cloud-api.yandex.net/v1/disk/public/resources"
 
 
+def fix_long_path(path):
+    """Возвращает путь, безопасный для Windows (длинные имена обрабатываются через префикс \\\\?\\ )."""
+    if sys.platform != 'win32':
+        return path
+    if path.startswith('\\\\?\\'):
+        return path
+    abs_path = os.path.abspath(path)
+    if len(abs_path) > 250:
+        return '\\\\?\\' + abs_path
+    return abs_path
+
+
 def fetch_with_retry(url, timeout=30, retries=5, backoff=3):
     """Выполняет GET-запрос с повторными попытками при сетевых сбоях/таймаутах."""
     last_err = None
@@ -52,12 +64,13 @@ def get_download_url(public_key, path):
 
 
 def download_file(url, dest_path):
-    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    dest_path_fixed = fix_long_path(dest_path)
+    os.makedirs(os.path.dirname(dest_path_fixed) or ".", exist_ok=True)
     last_err = None
     for attempt in range(1, 4):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=60) as r, open(dest_path, "wb") as f:
+            with urllib.request.urlopen(req, timeout=60) as r, open(dest_path_fixed, "wb") as f:
                 total = int(r.headers.get("Content-Length", 0))
                 downloaded = 0
                 while chunk := r.read(1024 * 256):
@@ -115,7 +128,6 @@ def main():
 
     if not files:
         print("Файлов не найдено (возможно, это одиночный файл).")
-        # Попробовать скачать как одиночный файл
         try:
             dl_url = get_download_url(public_key, "/")
             name = os.path.join(dest_dir, "file")
@@ -135,9 +147,12 @@ def main():
         dest_path = os.path.join(dest_dir, rel_path)
 
         print(f"[{i}/{len(files)}] {rel_path}")
-        if os.path.exists(dest_path) and os.path.getsize(dest_path) == item.get("size", -1):
+
+        dest_path_fixed = fix_long_path(dest_path)
+        if os.path.exists(dest_path_fixed) and os.path.getsize(dest_path_fixed) == item.get("size", -1):
             print("  пропускаю (уже скачан)")
             continue
+
         try:
             dl_url = get_download_url(public_key, item["path"])
             download_file(dl_url, dest_path)
