@@ -1,0 +1,99 @@
+{
+  "schemas": {
+    "Стандартная (12 полей)": {
+      "schema": {
+        "АВС/ DEF": "int",
+        "От": "int",
+        "До": "int",
+        "Емкость": "int",
+        "Оператор": "string",
+        "Регион": "string",
+        "Территория ГАР": "string",
+        "ИНН": "int"
+      },
+      "key_columns": [
+        "АВС/ DEF",
+        "От",
+        "До",
+        "Емкость"
+      ],
+      "tolerance": 0.0
+    },
+    "DZO Revenue Forecast 9+3": {
+      "schema": {
+        "Код ДЗО Forecast": "string",
+        "Код ЦФО": "string",
+        "Статья Hyperion Forecast": "string",
+        "Сегмент для отчета": "string",
+        "Источник аллокации": "string",
+        "Q3": "string",
+        "Q4": "float",
+        "Jul": "float",
+        "Aug": "float",
+        "Sep": "float",
+        "Oct": "float",
+        "Nov": "float",
+        "Dec": "float"
+      },
+      "key_columns": [
+        "Код ДЗО Forecast",
+        "Код ЦФО",
+        "Статья Hyperion Forecast",
+        "Сегмент для отчета",
+        "Источник аллокации"
+      ],
+      "tolerance": 0.0001
+    },
+    "DZO Revenue Forecast (Q)": {
+      "schema": {
+        "Код ДЗО Forecast": "string",
+        "Код ЦФО": "string",
+        "Статья Hyperion Forecast": "string",
+        "Сегмент для отчета": "string",
+        "Источник аллокации": "string",
+        "Квартал": "string",
+        "Значение": "float"
+      },
+      "key_columns": [
+        "Код ДЗО Forecast",
+        "Код ЦФО",
+        "Статья Hyperion Forecast",
+        "Сегмент для отчета",
+        "Источник аллокации",
+        "Квартал"
+      ],
+      "tolerance": 0.0
+    },
+    "DZO Percent": {
+      "schema": {
+        "Код ДЗО Forecast": "string",
+        "Сегмент для отчета": "string",
+        "%": "float"
+      },
+      "key_columns": [
+        "Код ДЗО Forecast",
+        "Сегмент для отчета"
+      ],
+      "tolerance": 0.0
+    },
+    "abc": {
+      "schema": {
+        "АВС/ DEF": "int",
+        "От": "int",
+        "До": "int",
+        "Емкость": "int",
+        "Оператор": "string",
+        "Регион": "string",
+        "Территория ГАР": "string",
+        "ИНН": "int"
+      },
+      "key_columns": [
+        "АВС/ DEF",
+        "От",
+        "До",
+        "Емкость"
+      ],
+      "tolerance": 0.0
+    }
+  }
+}

@@ -1,7 +1,7 @@
 import sys
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel,
+    QApplication, QWidget, QLabel,
     QPushButton, QVBoxLayout, QHBoxLayout, QListWidget
 )
 from PySide6.QtGui import QFont
@@ -11,10 +11,6 @@ class Stopwatch(QWidget):
         super().__init__()
         self.setWindowTitle("Секундомер")
         self.setFixedSize(350, 400)
-
-        # # Центральный виджет
-        # central_widget = QWidget()
-        # self.setCentralWidget(central_widget)
 
         # Состояние: прошедшие миллисекунды
         self.elapsed_ms = 0
