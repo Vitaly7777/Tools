@@ -430,8 +430,9 @@ class CompareWorker(QThread):
         self.chunksize = chunksize
         self.encoding = encoding
         self.csv_separator = csv_separator
-
+    
     def run(self):
+        comparator = None 
         try:
             self.progress.emit("Создание компаратора...")
             # ИСПОЛЬЗУЕМ ФАБРИКУ
