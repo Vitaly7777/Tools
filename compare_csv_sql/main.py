@@ -430,8 +430,9 @@ class CompareWorker(QThread):
         self.chunksize = chunksize
         self.encoding = encoding
         self.csv_separator = csv_separator
-
+    
     def run(self):
+        comparator = None 
         try:
             self.progress.emit("Создание компаратора...")
             # ИСПОЛЬЗУЕМ ФАБРИКУ
@@ -784,7 +785,6 @@ class MainWindow(QMainWindow):
 
         params_layout.addLayout(control_buttons)
 
-        layout.addLayout(schema_layout)
         layout.addLayout(params_layout)
 
         return group

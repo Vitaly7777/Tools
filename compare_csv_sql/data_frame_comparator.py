@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 from typing import Dict, List, Tuple, Optional
 
 # Импортируем чанковый компаратор (если модуль доступен)
@@ -208,7 +207,7 @@ def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
             chunksize=chunksize,
             db_path=db_path,
             encoding=encoding,
-            separator=separator
+            sep=separator
         )
     else:
         return InMemoryComparator(df1, df2, tolerance, schema, key_columns)
