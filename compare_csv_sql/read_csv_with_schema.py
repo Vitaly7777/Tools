@@ -52,12 +52,6 @@ def read_csv_with_schema_v1(
         # Читаем файл с указанной типизацией
         df = pd.read_csv(file_path, dtype=dtype_dict, **kwargs)
         
-        print(f"Файл успешно загружен: {file_path}")
-        print(f"Количество строк: {len(df)}")
-        print(f"Количество столбцов: {len(df.columns)}")
-        print("\nТипы данных:")
-        print(df.dtypes)
-        
         return df
     
     except FileNotFoundError:

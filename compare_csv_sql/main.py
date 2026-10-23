@@ -20,6 +20,8 @@ from PySide6.QtGui import QFont, QTextCursor, QIcon, QAction, QColor
 from read_csv_with_schema import read_csv_with_schema_v1
 # ИЗМЕНЕНО: используем фабрику вместо прямого импорта класса
 from data_frame_comparator import create_comparator, InMemoryComparator
+# Общие утилиты
+from utils import parse_schema_text, parse_key_columns
 
 
 class SchemaManager:
@@ -220,9 +222,9 @@ def check_key_uniqueness(df: pd.DataFrame, key_columns: List[str], df_name: str 
     if missing_columns:
         return True, []  # Пропускаем проверку если нет столбцов
     
-    # Создаем составной ключ
+    # Создаем составной ключ с SEP='\x01' (не встречается в обычных данных)
     df_temp = df.copy()
-    df_temp['_composite_key'] = df_temp[key_columns].astype(str).agg('|'.join, axis=1)
+    df_temp['_composite_key'] = df_temp[key_columns].astype(str).agg('\x01'.join, axis=1)
     
     # Находим дубликаты
     duplicates = df_temp['_composite_key'].duplicated(keep=False)
@@ -234,7 +236,7 @@ def check_key_uniqueness(df: pd.DataFrame, key_columns: List[str], df_name: str 
         # Декодируем ключи обратно в кортежи
         decoded_keys = []
         for key in duplicate_keys:
-            values = key.split('|')
+            values = key.split('\x01')
             decoded_keys.append(tuple(values))
         
         return False, decoded_keys
@@ -351,33 +353,11 @@ class SchemaEditorDialog(QDialog):
                 QMessageBox.warning(self, "Предупреждение", "Введите имя схемы!")
                 return
             
-            # Парсим схему
-            schema_text = self.schema_edit.toPlainText().strip()
-            if not schema_text:
-                QMessageBox.warning(self, "Предупреждение", "Схема пуста!")
-                return
+            # Парсим схему через утилиту
+            schema = parse_schema_text(schema_text)
             
-            schema = {}
-            for line in schema_text.split("\n"):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                
-                parts = line.split(":")
-                if len(parts) != 2:
-                    raise ValueError(f"Неверный формат строки: {line}")
-                
-                col_name = parts[0].strip()
-                col_type = parts[1].strip().lower()
-                
-                if col_type not in ["string", "float", "int", "bool"]:
-                    raise ValueError(f"Неподдерживаемый тип '{col_type}'")
-                
-                schema[col_name] = col_type
-            
-            # Парсим ключевые столбцы
-            key_text = self.key_columns_edit.text().strip()
-            key_columns = [col.strip() for col in key_text.split(",")] if key_text else []
+            # Парсим ключевые столбцы через утилиту
+            key_columns = parse_key_columns(self.key_columns_edit.text())
             
             # Проверяем, что все ключевые столбцы есть в схеме
             for col in key_columns:
@@ -934,32 +914,10 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Предупреждение", "Схема пуста!")
                 return
             
-            schema = {}
-            for line in schema_text.split("\n"):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                
-                parts = line.split(":")
-                if len(parts) != 2:
-                    raise ValueError(f"Неверный формат строки: {line}")
-                
-                col_name = parts[0].strip()
-                col_type = parts[1].strip().lower()
-                
-                if col_type not in ["string", "float", "int", "bool"]:
-                    raise ValueError(f"Неподдерживаемый тип '{col_type}'")
-                
-                schema[col_name] = col_type
+            schema = parse_schema_text(schema_text)
             
-            self.current_schema = schema
-            
-            # Обновляем ключевые столбцы
-            key_text = self.key_columns_edit.text().strip()
-            if key_text:
-                self.current_compare_columns = [col.strip() for col in key_text.split(",")]
-            else:
-                self.current_compare_columns = list(schema.keys())
+            # Обновляем ключевые столбцы через утилиту
+            self.current_compare_columns = parse_key_columns(self.key_columns_edit.text())
             
             # Обновляем точность из интерфейса
             self.current_tolerance = self.tolerance_spin.value() / 1_000_000
@@ -979,27 +937,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Предупреждение", "Схема пуста!")
                 return
             
-            schema = {}
-            for line in schema_text.split("\n"):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                
-                parts = line.split(":")
-                if len(parts) != 2:
-                    raise ValueError(f"Неверный формат строки: {line}")
-                
-                col_name = parts[0].strip()
-                col_type = parts[1].strip().lower()
-                
-                if col_type not in ["string", "float", "int", "bool"]:
-                    raise ValueError(f"Неподдерживаемый тип '{col_type}'")
-                
-                schema[col_name] = col_type
+            # Парсим схему через утилиту
+            schema = parse_schema_text(schema_text)
             
-            # Получаем ключевые столбцы
-            key_text = self.key_columns_edit.text().strip()
-            key_columns = [col.strip() for col in key_text.split(",")] if key_text else []
+            # Получаем ключевые столбцы через утилиту
+            key_columns = parse_key_columns(self.key_columns_edit.text())
             
             # Получаем точность из интерфейса
             tolerance = self.tolerance_spin.value() / 1_000_000
@@ -1046,17 +988,11 @@ class MainWindow(QMainWindow):
         schema = {}
         if schema_text:
             try:
-                for line in schema_text.split("\n"):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parts = line.split(":")
-                    if len(parts) == 2:
-                        schema[parts[0].strip()] = parts[1].strip().lower()
-            except:
+                schema = parse_schema_text(schema_text)
+            except Exception:
                 schema = {}
         
-        key_columns = [col.strip() for col in key_text.split(",")] if key_text else []
+        key_columns = parse_key_columns(self.key_columns_edit.text())
         
         schema_data = {
             'schema': schema,
@@ -1593,49 +1529,9 @@ class MainWindow(QMainWindow):
                 
                 table.setItem(row_idx, col_idx, item)
         
-        # Подсвечиваем заголовки столбцов с различиями
-        header = table.horizontalHeader()
-        for col_idx, col_name in enumerate(df.columns):
-            for base_name, (df1_col, df2_col) in col_mapping.items():
-                if col_name == df1_col or col_name == df2_col:
-                    # Проверяем, есть ли в этом столбце различия
-                    has_diff = False
-                    for row_idx in range(len(df)):
-                        val1 = df.iloc[row_idx][df1_col]
-                        val2 = df.iloc[row_idx][df2_col]
-                        
-                        if pd.isna(val1) and pd.isna(val2):
-                            continue
-                        elif pd.isna(val1) or pd.isna(val2):
-                            has_diff = True
-                            break
-                        elif isinstance(val1, (int, float)) and isinstance(val2, (int, float)):
-                            tolerance = self.tolerance_spin.value() / 1_000_000
-                            if abs(float(val1) - float(val2)) > tolerance:
-                                has_diff = True
-                                break
-                        elif str(val1) != str(val2):
-                            has_diff = True
-                            break
-                    
-                    if has_diff:
-                        # Создаем виджет для заголовка с подсветкой
-                        header_widget = QWidget()
-                        header_layout = QHBoxLayout(header_widget)
-                        header_layout.setContentsMargins(5, 0, 5, 0)
-                        
-                        label = QLabel(col_name)
-                        if col_name.endswith("_df1"):
-                            label.setStyleSheet("background-color: #FFCCCC; font-weight: bold; padding: 2px;")
-                        elif col_name.endswith("_df2"):
-                            label.setStyleSheet("background-color: #CCFFCC; font-weight: bold; padding: 2px;")
-                        
-                        header_layout.addWidget(label)
-                        table.setCellWidget(-1, col_idx, header_widget)
-                    
-                    break
-        
-        # Автоматическая ширина столбцов
+        # Подсветка заголовков столбцов с различиями (опционально, через QHeaderView)
+        # Примечание: QHeaderView.setCellWidget недоступен в Qt5/PySide6,
+        # поэтому подсветка заголовков реализована через stylesheet
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setStretchLastSection(True)
@@ -1648,7 +1544,7 @@ class MainWindow(QMainWindow):
         return widget
 
     def _save_results(self):
-        """Сохранение результатов"""
+        """Сохранение результатов в единый Excel-файл с вкладками"""
         if self.comparator is None:
             QMessageBox.warning(self, "Предупреждение", "Нет результатов для сохранения!")
             return
@@ -1662,49 +1558,69 @@ class MainWindow(QMainWindow):
             save_dir = output_dir / f"comparison_{timestamp}"
             save_dir.mkdir(parents=True, exist_ok=True)
             
-            saved_files = []
+            # Единый Excel-файл с вкладками
+            excel_path = save_dir / f"report_{timestamp}.xlsx"
             
-            if not self.comparator.df1_only.empty:
-                path = str(save_dir / "df1_only.xlsx")
-                self.comparator.df1_only.to_excel(path, index=False)
-                saved_files.append(path)
-                self.log(f"Сохранено: {path}")
+            with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                sheet_num = 1
+                
+                if not self.comparator.df1_only.empty:
+                    self.comparator.df1_only.to_excel(
+                        writer, sheet_name=f"Только в df1 ({len(self.comparator.df1_only)})", index=False
+                    )
+                    sheet_num += 1
+                
+                if not self.comparator.df2_only.empty:
+                    self.comparator.df2_only.to_excel(
+                        writer, sheet_name=f"Только в df2 ({len(self.comparator.df2_only)})", index=False
+                    )
+                    sheet_num += 1
+                
+                if self.comparator.df1_df2_value is not None and not self.comparator.df1_df2_value.empty:
+                    self.comparator.df1_df2_value.to_excel(
+                        writer, sheet_name=f"Различия ({len(self.comparator.df1_df2_value)})", index=False
+                    )
+                    sheet_num += 1
+                
+                # Сводка
+                summary_data = {
+                    "Параметр": [
+                        "Файл 1 (строк)",
+                        "Файл 2 (строк)",
+                        "Только в df1",
+                        "Только в df2",
+                        "Различия в значениях",
+                        "Время сравнения"
+                    ],
+                    "Значение": [
+                        str(len(self.df1)) if self.df1 is not None else "N/A",
+                        str(len(self.df2)) if self.df2 is not None else "N/A",
+                        str(len(self.comparator.df1_only)),
+                        str(len(self.comparator.df2_only)),
+                        str(len(self.comparator.df1_df2_value)) if self.comparator.df1_df2_value is not None else "0",
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    ]
+                }
+                pd.DataFrame(summary_data).to_excel(writer, sheet_name="Сводка", index=False)
             
-            if not self.comparator.df2_only.empty:
-                path = str(save_dir / "df2_only.xlsx")
-                self.comparator.df2_only.to_excel(path, index=False)
-                saved_files.append(path)
-                self.log(f"Сохранено: {path}")
-            
-            if self.comparator.df1_df2_value is not None and not self.comparator.df1_df2_value.empty:
-                path = str(save_dir / "differences.xlsx")
-                self.comparator.df1_df2_value.to_excel(path, index=False)
-                saved_files.append(path)
-                self.log(f"Сохранено: {path}")
+            self.log(f"Сохранено: {excel_path}")
             
             # Сохраняем информацию о предупреждениях, если они были
             if self.key_uniqueness_warnings:
-                warnings_path = str(save_dir / "key_uniqueness_warnings.txt")
+                warnings_path = save_dir / "key_uniqueness_warnings.txt"
                 with open(warnings_path, 'w', encoding='utf-8') as f:
                     for msg, details in self.key_uniqueness_warnings:
                         f.write(f"{msg}\n")
                         f.write("=" * 80 + "\n")
                         f.write(f"{details}\n")
                         f.write("\n" + "=" * 80 + "\n\n")
-                saved_files.append(warnings_path)
                 self.log(f"Сохранено: {warnings_path}")
             
-            if saved_files:
-                QMessageBox.information(
-                    self, "Сохранение",
-                    f"Результаты сохранены в:\n{save_dir}\n\n"
-                    f"Сохранено файлов: {len(saved_files)}"
-                )
-            else:
-                QMessageBox.information(
-                    self, "Информация",
-                    "Нет данных для сохранения"
-                )
+            QMessageBox.information(
+                self, "Сохранение",
+                f"Результаты сохранены в:\n{excel_path}\n\n"
+                f"Файл содержит {sheet_num} вкладок с результатами сравнения."
+            )
             
         except Exception as e:
             QMessageBox.critical(self, "Ошибка сохранения", str(e))

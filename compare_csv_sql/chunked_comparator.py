@@ -6,6 +6,12 @@ import tempfile
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 
+# Импортируем общую утилиту
+try:
+    from utils import sort_columns_with_suffixes
+except ImportError:
+    sort_columns_with_suffixes = None
+
 SEP = '\x01'
 
 
@@ -219,6 +225,10 @@ class ChunkedComparator:
             self.df1_df2_value = pd.DataFrame(columns=cols)
 
     def _sort_columns_with_suffixes(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Передаёт работу общей утилите из utils.py"""
+        if sort_columns_with_suffixes:
+            return sort_columns_with_suffixes(df, self.key_columns)
+        # Fallback: оригинальная реализация
         key_cols = [col for col in self.key_columns if col in df.columns]
         other_cols = [col for col in df.columns if col not in key_cols]
         base_names = set()
