@@ -2245,7 +2245,9 @@ class MainWindow(QMainWindow):
             )
             
             if reply == QMessageBox.Open:
-                os.startfile(str(excel_path.parent))
+                from PySide6.QtCore import QUrl
+                from PySide6.QtGui import QDesktopServices
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(excel_path.parent)))
             
         except Exception as e:
             QMessageBox.critical(self, "Ошибка сохранения", str(e))

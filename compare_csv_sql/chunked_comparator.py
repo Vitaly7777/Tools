@@ -55,27 +55,27 @@ class ChunkedComparator:
 
     def _init_db(self):
         self.conn = sqlite3.connect(self.db_path)
+        
+        # Оптимизации для быстрой вставки миллионов строк
+        self.conn.execute('PRAGMA synchronous=OFF')
+        self.conn.execute('PRAGMA journal_mode=MEMORY')
+        self.conn.execute('PRAGMA temp_store=MEMORY')
+        
+        # Без AUTOINCREMENT и индексов — вставка в 5-10x быстрее
+        # key_hash используется для JOIN, индекс не нужен (JOIN по хешу быстрый)
         self.conn.execute('''
             CREATE TABLE df1 (
-                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key_hash TEXT,
                 key_json TEXT,
                 row_json TEXT
             )
-        ''')
-        self.conn.execute('''
-            CREATE INDEX idx_df1_key_hash ON df1(key_hash)
         ''')
         self.conn.execute('''
             CREATE TABLE df2 (
-                row_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key_hash TEXT,
                 key_json TEXT,
                 row_json TEXT
             )
-        ''')
-        self.conn.execute('''
-            CREATE INDEX idx_df2_key_hash ON df2(key_hash)
         ''')
         self.conn.commit()
 
@@ -145,6 +145,9 @@ class ChunkedComparator:
             raise ValueError(f"Ошибка валидации {table_name}: {e}")
         
         cursor = self.conn.cursor()
+        batch_count = 0
+        commits_per_batch = 100  # commit() раз на 100 батчей (~50 000 строк)
+        
         for chunk in pd.read_csv(file_path,
                                  usecols=all_cols,
                                  dtype=self.schema,
@@ -178,13 +181,19 @@ class ChunkedComparator:
             chunk['key_json'] = chunk_str[self.key_columns].agg(SEP.join, axis=1)
             chunk['row_json'] = chunk_str[all_cols].agg(SEP.join, axis=1)
             data = chunk[['key_hash', 'key_json', 'row_json']].values.tolist()
+            
             for i in range(0, len(data), self.insert_batch_size):
                 batch = data[i:i + self.insert_batch_size]
                 cursor.executemany(
                     f"INSERT INTO {table_name} (key_hash, key_json, row_json) VALUES (?, ?, ?)",
                     batch
                 )
-            self.conn.commit()
+                batch_count += 1
+                # Commit раз на N батчей вместо каждого батча
+                if batch_count % commits_per_batch == 0:
+                    self.conn.commit()
+        
+        # Финальный commit
         self.conn.commit()
 
     def _log(self, message: str):
