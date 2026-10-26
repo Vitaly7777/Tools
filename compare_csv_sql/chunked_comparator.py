@@ -137,13 +137,24 @@ class ChunkedComparator:
                                  encoding=self.encoding,
                                  sep=self.sep):
             # Оптимизация: один astype(str) вместо трёх
-            chunk_str = chunk.astype(str).fillna('')
+            # chunk_str = chunk.astype(str).fillna('')
+            # ВАЖНО: fillna ДО astype — иначе NaN превращается в строку 'nan'
+            # и fillna('') уже ничего не делает.
+            chunk_str = chunk.fillna('').astype(str)            
 
             # Оптимизация: векторизованное хеширование
-            key_strs = chunk_str[self.key_columns].copy()
-            # Заменяем SEP внутри значений, чтобы не ломать парсинг
-            key_strs = key_strs.replace(SEP, ' ', regex=True)
+            # key_strs = chunk_str[self.key_columns].copy()
+            # # Заменяем SEP внутри значений, чтобы не ломать парсинг
+            # key_strs = key_strs.replace(SEP, ' ', regex=True)
+            # key_hash_input = key_strs.agg(SEP.join, axis=1)
+            # Экранируем SEP во ВСЕХ строках один раз, а не только в ключах:
+            # иначе row_json/key_json содержат "сырой" \x01 и обратный
+            # split(SEP) в compare() даст некорректные столбцы.
+            chunk_str = chunk_str.replace(SEP, ' ', regex=True)
+
+            key_strs = chunk_str[self.key_columns]
             key_hash_input = key_strs.agg(SEP.join, axis=1)
+
             chunk['key_hash'] = key_hash_input.apply(
                 lambda s: hashlib.md5(s.encode('utf-8')).hexdigest()
             )
@@ -250,18 +261,33 @@ class ChunkedComparator:
             row1_split.columns = all_cols
             row2_split.columns = all_cols
 
-            # Фильтр по tolerance
-            if self.tolerance == 0:
-                mask = pd.Series([True] * len(row1_split))
-            else:
-                mask = pd.Series([True] * len(row1_split))
-                for col in non_key_cols:
-                    if self.schema.get(col) == 'float':
-                        diff_abs = (pd.to_numeric(row1_split[col], errors='coerce') -
-                                    pd.to_numeric(row2_split[col], errors='coerce')).abs()
-                        mask &= (diff_abs > self.tolerance)
-                    elif self.schema.get(col) == 'string':
-                        mask &= (row1_split[col] != row2_split[col])
+            # # Фильтр по tolerance
+            # if self.tolerance == 0:
+            #     mask = pd.Series([True] * len(row1_split))
+            # else:
+            #     mask = pd.Series([True] * len(row1_split))
+            #     for col in non_key_cols:
+            #         if self.schema.get(col) == 'float':
+            #             diff_abs = (pd.to_numeric(row1_split[col], errors='coerce') -
+            #                         pd.to_numeric(row2_split[col], errors='coerce')).abs()
+            #             mask &= (diff_abs > self.tolerance)
+            #         elif self.schema.get(col) == 'string':
+            #             mask &= (row1_split[col] != row2_split[col])
+
+            # Фильтр по tolerance: строка остаётся в отчёте,
+            # если ХОТЯ БЫ ОДИН неключевой столбец вне допуска.
+            # Ранее использовался AND — ошибочно оставляло только строки,
+            # где ВСЕ столбцы различаются одновременно.
+            mask = pd.Series(False, index=row1_split.index)
+            for col in non_key_cols:
+                if self.schema.get(col) == 'float':
+                    n1 = pd.to_numeric(row1_split[col], errors='coerce')
+                    n2 = pd.to_numeric(row2_split[col], errors='coerce')
+                    # Различие вне допуска ИЛИ ровно один NaN
+                    col_diff = ((n1 - n2).abs() > self.tolerance) | (n1.isna() ^ n2.isna())
+                    mask |= col_diff
+                elif self.schema.get(col) == 'string':
+                    mask |= (row1_split[col] != row2_split[col])            
 
             row1_split = row1_split[mask]
             row2_split = row2_split[mask]
@@ -309,12 +335,26 @@ class ChunkedComparator:
         return df[key_cols + sorted_other_cols]
 
     def close(self):
+        # if self.conn:
+        #     self.conn.close()
+        # if self._temp_dir and os.path.exists(self._temp_dir):
+        #     import shutil
+        #     shutil.rmtree(self._temp_dir)
+        #     self._temp_dir = None
+
+        """Закрывает соединение с БД. Временные файлы НЕ удаляются —
+        для их удаления вызовите cleanup()."""
         if self.conn:
             self.conn.close()
+            self.conn = None
+
+    def cleanup(self):
+        """Удаляет временные файлы с полными результатами."""
         if self._temp_dir and os.path.exists(self._temp_dir):
             import shutil
             shutil.rmtree(self._temp_dir)
             self._temp_dir = None
+        self._saved_files = []
 
     def get_saved_files(self) -> List[str]:
         """Возвращает пути к сохранённым полным результатам."""

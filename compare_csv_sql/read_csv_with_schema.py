@@ -37,7 +37,16 @@ def read_csv_with_schema_v1(
     
     try:
         # Сначала читаем файл без типизации для получения названий столбцов
-        df_temp = pd.read_csv(file_path, nrows=0)
+        # df_temp = pd.read_csv(file_path, nrows=0)
+        # Сначала читаем файл без типизации для получения названий столбцов.
+        # ВАЖНО: sep/encoding должны совпадать с финальным чтением,
+        # иначе заголовки распарсятся неверно (например, "a;b" станет одним
+        # столбцом) и dtype-схема не применится ни к одному столбцу.
+        header_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k in ('sep', 'delimiter', 'encoding', 'sep_whitespace', 'quotechar')
+        }
+        df_temp = pd.read_csv(file_path, nrows=0, **header_kwargs)        
         columns = df_temp.columns.tolist()
         
         # Создаем словарь dtype для всех столбцов

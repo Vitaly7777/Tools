@@ -210,6 +210,30 @@
         "До"
       ],
       "tolerance": 0.0
+    },
+    "123": {
+      "schema": {
+        "Код ДЗО Forecast": "string",
+        "Код ЦФО": "string",
+        "Статья Hyperion Forecast": "string",
+        "Сегмент для отчета": "string",
+        "Источник аллокации": "string",
+        "Q3": "string",
+        "Q4": "float",
+        "Jul": "float",
+        "Aug": "float",
+        "Sep": "float",
+        "Oct": "float",
+        "Nov": "float",
+        "Dec": "float"
+      },
+      "key_columns": [
+        "Код ДЗО Forecast",
+        "Код ЦФО",
+        "Статья Hyperion Forecast",
+        "Сегмент для отчета"
+      ],
+      "tolerance": 0.001
     }
   }
 }

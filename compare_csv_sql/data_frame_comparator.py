@@ -104,59 +104,129 @@ class InMemoryComparator:
         self.validate_schema()
         self.sort_dataframes()
 
-        # Оптимизация: apply(tuple) вместо iterrows() — в 2-3x быстрее
-        df1_dict = dict(
-            zip(
-                self.df1[self.key_columns].apply(tuple, axis=1),
-                self.df1.index
-            )
-        )
-        df2_dict = dict(
-            zip(
-                self.df2[self.key_columns].apply(tuple, axis=1),
-                self.df2.index
-            )
-        )
+        # # Оптимизация: apply(tuple) вместо iterrows() — в 2-3x быстрее
+        # df1_dict = dict(
+        #     zip(
+        #         self.df1[self.key_columns].apply(tuple, axis=1),
+        #         self.df1.index
+        #     )
+        # )
+        # df2_dict = dict(
+        #     zip(
+        #         self.df2[self.key_columns].apply(tuple, axis=1),
+        #         self.df2.index
+        #     )
+        # )
 
-        df1_only_indices = []
-        df2_only_indices = []
-        df1_df2_value_data = []
+        # df1_only_indices = []
+        # df2_only_indices = []
+        # df1_df2_value_data = []
+        # non_key_columns = self._get_non_key_columns()
+
+        # for key, idx1 in df1_dict.items():
+        #     if key not in df2_dict:
+        #         df1_only_indices.append(idx1)
+        #     else:
+        #         idx2 = df2_dict[key]
+        #         row1 = self.df1.iloc[idx1]
+        #         row2 = self.df2.iloc[idx2]
+        #         has_diff = False
+        #         diff_data = {col: row1[col] for col in self.key_columns}
+        #         for col in non_key_columns:
+        #             if not self._values_equal(row1[col], row2[col]):
+        #                 has_diff = True
+        #                 diff_data[f"{col}_df1"] = row1[col]
+        #                 diff_data[f"{col}_df2"] = row2[col]
+        #             else:
+        #                 diff_data[f"{col}_df1"] = row1[col]
+        #                 diff_data[f"{col}_df2"] = row2[col]
+        #         if has_diff:
+        #             df1_df2_value_data.append(diff_data)
+
+        # for key, idx2 in df2_dict.items():
+        #     if key not in df1_dict:
+        #         df2_only_indices.append(idx2)
+
+        # self.df1_only = self.df1.iloc[df1_only_indices].reset_index(drop=True) \
+        #     if df1_only_indices else pd.DataFrame(columns=self.df1.columns)
+        # self.df2_only = self.df2.iloc[df2_only_indices].reset_index(drop=True) \
+        #     if df2_only_indices else pd.DataFrame(columns=self.df2.columns)
+
+        # if df1_df2_value_data:
+        #     self.df1_df2_value = pd.DataFrame(df1_df2_value_data)
+        #     self.df1_df2_value = self._sort_columns_with_suffixes(self.df1_df2_value)
+        # else:
+            # self.df1_df2_value = None
+
         non_key_columns = self._get_non_key_columns()
 
-        for key, idx1 in df1_dict.items():
-            if key not in df2_dict:
-                df1_only_indices.append(idx1)
-            else:
-                idx2 = df2_dict[key]
-                row1 = self.df1.iloc[idx1]
-                row2 = self.df2.iloc[idx2]
-                has_diff = False
-                diff_data = {col: row1[col] for col in self.key_columns}
-                for col in non_key_columns:
-                    if not self._values_equal(row1[col], row2[col]):
-                        has_diff = True
-                        diff_data[f"{col}_df1"] = row1[col]
-                        diff_data[f"{col}_df2"] = row2[col]
-                    else:
-                        diff_data[f"{col}_df1"] = row1[col]
-                        diff_data[f"{col}_df2"] = row2[col]
-                if has_diff:
-                    df1_df2_value_data.append(diff_data)
+        # КРИТИЧНО: дубликаты ключей ломают и dict-подход (оставляет последний),
+        # и merge (размножает строки). Явно проверяем и падаем с понятной ошибкой.
+        if self.df1.duplicated(subset=self.key_columns, keep=False).any():
+            raise ValueError(
+                f"В df1 обнаружены неуникальные ключи по {self.key_columns}. "
+                "Сравнение невозможно — включите агрегацию дубликатов "
+                "или проверьте входные данные."
+            )
+        if self.df2.duplicated(subset=self.key_columns, keep=False).any():
+            raise ValueError(
+                f"В df2 обнаружены неуникальные ключи по {self.key_columns}. "
+                "Сравнение невозможно — включите агрегацию дубликатов "
+                "или проверьте входные данные."
+            )
 
-        for key, idx2 in df2_dict.items():
-            if key not in df1_dict:
-                df2_only_indices.append(idx2)
+        merged = self.df1.merge(
+            self.df2,
+            on=self.key_columns,
+            how='outer',
+            suffixes=('_df1', '_df2'),
+            indicator=True,
+            sort=False,
+        )
 
-        self.df1_only = self.df1.iloc[df1_only_indices].reset_index(drop=True) \
-            if df1_only_indices else pd.DataFrame(columns=self.df1.columns)
-        self.df2_only = self.df2.iloc[df2_only_indices].reset_index(drop=True) \
-            if df2_only_indices else pd.DataFrame(columns=self.df2.columns)
+        df1_cols = list(self.key_columns) + [f"{c}_df1" for c in non_key_columns]
+        df2_cols = list(self.key_columns) + [f"{c}_df2" for c in non_key_columns]
+        flat_cols = list(self.key_columns) + list(non_key_columns)
 
-        if df1_df2_value_data:
-            self.df1_df2_value = pd.DataFrame(df1_df2_value_data)
-            self.df1_df2_value = self._sort_columns_with_suffixes(self.df1_df2_value)
-        else:
+        only1 = merged.loc[merged['_merge'] == 'left_only', df1_cols].reset_index(drop=True)
+        only1.columns = flat_cols
+        only2 = merged.loc[merged['_merge'] == 'right_only', df2_cols].reset_index(drop=True)
+        only2.columns = flat_cols
+
+        self.df1_only = only1 if not only1.empty else pd.DataFrame(columns=self.df1.columns)
+        self.df2_only = only2 if not only2.empty else pd.DataFrame(columns=self.df2.columns)
+
+        both = merged.loc[merged['_merge'] == 'both'].reset_index(drop=True)
+        if both.empty:
             self.df1_df2_value = None
+            return
+
+        # Векторизованная маска: строка различий, если ХОТЯ БЫ ОДИН
+        # неключевой столбец не совпал (учитываем tolerance и NaN)
+        diff_mask = pd.Series(False, index=both.index)
+        for col in non_key_columns:
+            s1 = both[f"{col}_df1"]
+            s2 = both[f"{col}_df2"]
+            both_na = s1.isna() & s2.isna()
+            if pd.api.types.is_numeric_dtype(s1) and pd.api.types.is_numeric_dtype(s2):
+                diff = (s1.astype(float) - s2.astype(float)).abs()
+                equal = (diff <= self.float_tolerance) | both_na
+            else:
+                equal = (s1 == s2) | both_na
+            diff_mask |= ~equal
+
+        diff_df = both.loc[diff_mask]
+        if diff_df.empty:
+            self.df1_df2_value = None
+            return
+
+        result_data = {}
+        for col in self.key_columns:
+            result_data[col] = diff_df[col].values
+        for col in non_key_columns:
+            result_data[f"{col}_df1"] = diff_df[f"{col}_df1"].values
+            result_data[f"{col}_df2"] = diff_df[f"{col}_df2"].values
+        self.df1_df2_value = self._sort_columns_with_suffixes(pd.DataFrame(result_data))        
 
     def _sort_columns_with_suffixes(self, df: pd.DataFrame) -> pd.DataFrame:
         """Передаёт работу общей утилите из utils.py"""
@@ -221,7 +291,28 @@ def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
     Возвращает:
         Объект с методами compare() и атрибутами df1_only, df2_only, df1_df2_value.
     """
-    if use_chunked and df1_path and df2_path and ChunkedComparator is not None:
+    # if use_chunked and df1_path and df2_path and ChunkedComparator is not None:
+    #     return ChunkedComparator(
+    #         df1_path, df2_path,
+    #         key_columns, schema, tolerance,
+    #         chunksize=chunksize,
+    #         db_path=db_path,
+    #         encoding=encoding,
+    #         sep=separator
+    #     )
+    # else:
+    #     return InMemoryComparator(df1, df2, tolerance, schema, key_columns)
+
+    if use_chunked:
+        if ChunkedComparator is None:
+            raise RuntimeError(
+                "Чанковый режим недоступен: модуль chunked_comparator "
+                "не импортирован (проверьте установку зависимостей)."
+            )
+        if not df1_path or not df2_path:
+            raise ValueError(
+                "Для чанкового режима обязательны df1_path и df2_path."
+            )
         return ChunkedComparator(
             df1_path, df2_path,
             key_columns, schema, tolerance,
@@ -230,5 +321,8 @@ def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
             encoding=encoding,
             sep=separator
         )
-    else:
-        return InMemoryComparator(df1, df2, tolerance, schema, key_columns)
+    if df1 is None or df2 is None:
+        raise ValueError(
+            "Для in-memory режима обязательны df1 и df2 (DataFrame)."
+        )
+    return InMemoryComparator(df1, df2, tolerance, schema, key_columns)   

@@ -314,6 +314,15 @@ class SchemaEditorDialog(QDialog):
         )
         self.schema_edit.setText(schema_text)
         layout.addWidget(self.schema_edit)
+
+        # Ключевые столбцы
+        key_layout = QHBoxLayout()
+        key_layout.addWidget(QLabel("Ключевые столбцы (через запятую):"))
+        self.key_columns_edit = QLineEdit(
+            ", ".join(self.schema_data.get('key_columns', []))
+        )
+        key_layout.addWidget(self.key_columns_edit)
+        layout.addLayout(key_layout)        
         
         # Точность
         tolerance_layout = QHBoxLayout()
@@ -353,6 +362,23 @@ class SchemaEditorDialog(QDialog):
             
             # Получаем точность
             tolerance = self.tolerance_spin.value() / 1_000_000
+
+            #   +           
+            # Ключевые столбцы берём из текстового поля (ранее был NameError)
+            # +            
+            key_columns = [
+            # +
+                c.strip() for c in self.key_columns_edit.text().split(",")
+                if c.strip()
+            ]
+            missing = [c for c in key_columns if c not in schema]
+            if missing:
+                QMessageBox.warning(
+                    self, "Предупреждение",
+                    f"Ключевые столбцы отсутствуют в схеме: {', '.join(missing)}"
+                )
+                return
+            
             
             self.result = {
                 'name': name,
@@ -1532,14 +1558,38 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Предупреждение", "Сначала загрузите файлы!")
             return
 
-        # Парсим ключевые столбцы из таблицы схемы
+
+        # Освобождаем временные файлы предыдущего компаратора
+        if self.comparator is not None:
+            try:
+                if hasattr(self.comparator, 'cleanup'):
+                    self.comparator.cleanup()
+                elif hasattr(self.comparator, 'close'):
+                    self.comparator.close()
+            except Exception as e:
+                self.log(f"Не удалось освободить предыдущий компаратор: {e}", is_error=True)
+            self.comparator = None
+
+        # # Парсим ключевые столбцы из таблицы схемы
+        # self.current_compare_columns = self._get_key_columns_from_table()
+
+        # if not self.current_compare_columns:
+        #     QMessageBox.warning(self, "Предупреждение", "Укажите ключевые столбцы!")
+        #     return
+
+        # # Проверка наличия столбцов в схеме
+        # for col in self.current_compare_columns:
+
+        # ВАЖНО: перечитываем схему и ключи из таблицы на каждом запуске.
+        # Иначе пользователь редактирует таблицу, но сравнение идёт по схеме,
+        # сохранённой в последний apply_schema_template.
+        self.current_schema = self._get_schema_from_table()
         self.current_compare_columns = self._get_key_columns_from_table()
 
         if not self.current_compare_columns:
             QMessageBox.warning(self, "Предупреждение", "Укажите ключевые столбцы!")
             return
 
-        # Проверка наличия столбцов в схеме
         for col in self.current_compare_columns:
             if col not in self.current_schema:
                 QMessageBox.critical(
@@ -1555,23 +1605,53 @@ class MainWindow(QMainWindow):
         df1_to_compare = self.df1
         df2_to_compare = self.df2
 
-        if self.agg_checkbox.isChecked() and not self.chunked_checkbox.isChecked():
-            agg_func = self.agg_func_combo.currentText()
-            self.log("Агрегация дубликатов включена (функция: {})".format(agg_func))
+        # if self.agg_checkbox.isChecked() and not self.chunked_checkbox.isChecked():
+        #     agg_func = self.agg_func_combo.currentText()
+        #     self.log("Агрегация дубликатов включена (функция: {})".format(agg_func))
 
-            agg_df1, err1 = self._aggregate_duplicates(self.df1, self.current_compare_columns, agg_func)
-            if err1:
-                self.log(f"⚠️ df1: {err1}. Агрегация пропущена.", is_error=False)
-            else:
-                df1_to_compare = agg_df1
-                self.log(f"✓ df1 агрегирован: {len(self.df1)} → {len(df1_to_compare)} строк")
+        #     agg_df1, err1 = self._aggregate_duplicates(self.df1, self.current_compare_columns, agg_func)
+        #     if err1:
+        #         self.log(f"⚠️ df1: {err1}. Агрегация пропущена.", is_error=False)
+        #     else:
+        #         df1_to_compare = agg_df1
+        #         self.log(f"✓ df1 агрегирован: {len(self.df1)} → {len(df1_to_compare)} строк")
 
-            agg_df2, err2 = self._aggregate_duplicates(self.df2, self.current_compare_columns, agg_func)
-            if err2:
-                self.log(f"⚠️ df2: {err2}. Агрегация пропущена.", is_error=False)
+        #     agg_df2, err2 = self._aggregate_duplicates(self.df2, self.current_compare_columns, agg_func)
+        #     if err2:
+        #         self.log(f"⚠️ df2: {err2}. Агрегация пропущена.", is_error=False)
+        #     else:
+        #         df2_to_compare = agg_df2
+        #         self.log(f"✓ df2 агрегирован: {len(self.df2)} → {len(df2_to_compare)} строк")
+
+        if self.agg_checkbox.isChecked():
+            if self.chunked_checkbox.isChecked():
+                # Явно сообщаем, что агрегация не поддерживается
+                QMessageBox.warning(
+                    self, "Агрегация недоступна",
+                    "Агрегация дубликатов не поддерживается в чанковом режиме.\n"
+                    "Сравнение будет выполнено БЕЗ агрегации.\n\n"
+                    "Отключите чанковый режим, если нужна агрегация."
+                )
+                self.log("⚠️ Агрегация не поддерживается в чанковом режиме — пропущена")
             else:
-                df2_to_compare = agg_df2
-                self.log(f"✓ df2 агрегирован: {len(self.df2)} → {len(df2_to_compare)} строк")
+                agg_func = self.agg_func_combo.currentText()
+                self.log("Агрегация дубликатов включена (функция: {})".format(agg_func))
+
+                agg_df1, err1 = self._aggregate_duplicates(self.df1, self.current_compare_columns, agg_func)
+                if err1:
+                    self.log(f"⚠️ df1: {err1}. Агрегация пропущена.", is_error=False)
+                else:
+                    df1_to_compare = agg_df1
+                    self.log(f"✓ df1 агрегирован: {len(self.df1)} → {len(df1_to_compare)} строк")
+
+                agg_df2, err2 = self._aggregate_duplicates(self.df2, self.current_compare_columns, agg_func)
+                if err2:
+                    self.log(f"⚠️ df2: {err2}. Агрегация пропущена.", is_error=False)
+                else:
+                    df2_to_compare = agg_df2
+                    self.log(f"✓ df2 агрегирован: {len(self.df2)} → {len(df2_to_compare)} строк")
+
+    
         # --- КОНЕЦ АГРЕГАЦИИ ---
 
         self.key_uniqueness_warnings = []
@@ -1946,6 +2026,23 @@ class MainWindow(QMainWindow):
                 pd.DataFrame(summary_data).to_excel(writer, sheet_name="Сводка", index=False)
             
             self.log(f"Сохранено: {excel_path}")
+
+            # Для чанкового режима копируем ПОЛНЫЕ результаты из временного
+            # каталога (в comparator.df1_only/df2_only/diff лежит только
+            # усечённый max_display_rows preview).
+            if hasattr(self.comparator, 'get_saved_files'):
+                import shutil
+                copied = []
+                for src in self.comparator.get_saved_files():
+                    if os.path.exists(src):
+                        dst = save_dir / os.path.basename(src)
+                        shutil.copy2(src, dst)
+                        copied.append(str(dst))
+                if copied:
+                    self.log(f"Скопированы полные результаты ({len(copied)} файлов):")
+                    for c in copied:
+                        self.log(f"  {c}")
+                        
             
             # Сохраняем информацию о предупреждениях, если они были
             if self.key_uniqueness_warnings:
@@ -2088,6 +2185,14 @@ class MainWindow(QMainWindow):
             if self.worker.isRunning():
                 self.worker.terminate()
                 self.worker.wait()
+
+
+        # Удаляем временные файлы компаратора
+        if self.comparator is not None and hasattr(self.comparator, 'cleanup'):
+            try:
+                self.comparator.cleanup()
+            except Exception:
+                pass                
         
         event.accept()
 
