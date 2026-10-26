@@ -21,13 +21,17 @@ class InMemoryComparator:
     """
     def __init__(self, df1: pd.DataFrame, df2: pd.DataFrame, float_tolerance: float = 0.0,
                  schema_default=None,
-                 compare_columns: List[str] = None):
+                 compare_columns: List[str] = None,
+                 agg_func: str = None,
+                 log_callback=None):
         """
         Инициализация компаратора датафреймов
         """
         self.df1 = df1.copy()
         self.df2 = df2.copy()
         self.float_tolerance = float_tolerance
+        self.agg_func = agg_func
+        self.log_callback = log_callback
 
         if schema_default is None:
             schema_default = {
@@ -55,6 +59,11 @@ class InMemoryComparator:
         self.df2_only = None
         self.df1_df2_value = None
 
+    def _log(self, message: str):
+        """Отправка сообщения в лог"""
+        if self.log_callback:
+            self.log_callback(message)
+
     def validate_schema(self) -> bool:
         """Проверка соответствия схемы данных для обоих датафреймов"""
         for df_name, df in [("df1", self.df1), ("df2", self.df2)]:
@@ -76,6 +85,18 @@ class InMemoryComparator:
                         raise ValueError(
                             f"В датафрейме {df_name} столбец '{column}' имеет тип {actual_type}, "
                             f"ожидается float"
+                        )
+                elif expected_type == "int":
+                    if not pd.api.types.is_integer_dtype(actual_type):
+                        raise ValueError(
+                            f"В датафрейме {df_name} столбец '{column}' имеет тип {actual_type}, "
+                            f"ожидается int"
+                        )
+                elif expected_type == "bool":
+                    if not pd.api.types.is_bool_dtype(actual_type):
+                        raise ValueError(
+                            f"В датафрейме {df_name} столбец '{column}' имеет тип {actual_type}, "
+                            f"ожидается bool"
                         )
         return True
 
@@ -99,8 +120,101 @@ class InMemoryComparator:
             return abs(float(val1) - float(val2)) <= self.float_tolerance
         return val1 == val2
 
+    def aggregate(self, agg_func: str = 'sum'):
+        """
+        Агрегация дублирующихся строк по ключевым столбцам.
+        
+        Для каждого уникального ключа агрегирует неключевые столбцы:
+        - float: sum, mean, min, max
+        - string: первое значение (first)
+        
+        Args:
+            agg_func: функция агрегации ('sum', 'mean', 'min', 'max')
+        """
+        all_cols = list(self.schema.keys())
+        non_key_cols = [col for col in all_cols if col not in self.key_columns]
+        
+        self._log(f"\n{'='*60}")
+        self._log(f"НАЧАЛО АГРЕГАЦИИ ДУБЛИКАТОВ")
+        self._log(f"Функция агрегации: {agg_func}")
+        self._log(f"Ключевые столбцы: {', '.join(self.key_columns)}")
+        self._log(f"{'='*60}")
+        
+        for df_name, df in [('df1', self.df1), ('df2', self.df2)]:
+            # Получаем количество строк до агрегации
+            rows_before = len(df)
+            self._log(f"\nОбработка {df_name}: {rows_before} строк до агрегации")
+            
+            if df.empty:
+                self._log(f"  {df_name}: таблица пуста, пропуск")
+                continue
+            
+            # Проверяем, какие неключевые столбцы числовые
+            numeric_cols = []
+            non_numeric_cols = []
+            
+            for col in non_key_cols:
+                try:
+                    pd.to_numeric(df[col], errors='coerce')
+                    # Проверяем, что хотя бы 50% значений числовые
+                    numeric_count = df[col].apply(lambda x: pd.to_numeric(x, errors='ignore') if isinstance(x, str) else x).apply(
+                        lambda x: isinstance(x, (int, float))
+                    ).sum()
+                    if numeric_count > rows_before * 0.5:
+                        numeric_cols.append(col)
+                    else:
+                        non_numeric_cols.append(col)
+                except (ValueError, TypeError):
+                    non_numeric_cols.append(col)
+            
+            if numeric_cols:
+                self._log(f"  Числовые столбцы (агрегируются): {', '.join(numeric_cols)}")
+            if non_numeric_cols:
+                self._log(f"  Строковые столбцы (первое значение): {', '.join(non_numeric_cols)}")
+            
+            # Строим словарь агрегации
+            agg_dict = {}
+            for col in numeric_cols:
+                if agg_func == 'first':
+                    agg_dict[col] = 'first'
+                else:
+                    agg_dict[col] = agg_func
+            
+            for col in non_numeric_cols:
+                agg_dict[col] = 'first'
+            
+            # Выполняем агрегацию
+            if agg_dict:
+                df_agg = df.groupby(self.key_columns, as_index=False).agg(agg_dict)
+            else:
+                df_agg = df.drop_duplicates(subset=self.key_columns, keep='first')
+            
+            rows_after = len(df_agg)
+            duplicates_removed = rows_before - rows_after
+            
+            self._log(f"  После агрегации: {rows_after} строк")
+            self._log(f"  Удалено дубликатов: {duplicates_removed}")
+            
+            if duplicates_removed > 0:
+                self._log(f"  ✓ {df_name} агрегирован: {rows_before} → {rows_after} строк")
+            else:
+                self._log(f"  ℹ {df_name} дубликатов не найдено")
+            
+            # Обновляем DataFrame
+            if df_name == 'df1':
+                self.df1 = df_agg
+            else:
+                self.df2 = df_agg
+        
+        self._log(f"\nАГРЕГАЦИЯ ЗАВЕРШЕНА")
+        self._log(f"{'='*60}\n")
+
     def compare(self) -> None:
         """Выполнение сравнения датафреймов"""
+        # Агрегация если включена
+        if self.agg_func:
+            self.aggregate(self.agg_func)
+        
         self.validate_schema()
         self.sort_dataframes()
 
@@ -274,7 +388,8 @@ class InMemoryComparator:
 
 def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
                       use_chunked=False, df1_path=None, df2_path=None,
-                      chunksize=50000, db_path=None, encoding='utf-8', separator=','):
+                      chunksize=50000, db_path=None, encoding='utf-8', separator=',',
+                      agg_func=None, log_callback=None):
     """
     Возвращает подходящий компаратор в зависимости от режима.
 
@@ -319,10 +434,13 @@ def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
             chunksize=chunksize,
             db_path=db_path,
             encoding=encoding,
-            sep=separator
+            sep=separator,
+            agg_func=agg_func,
+            log_callback=log_callback
         )
     if df1 is None or df2 is None:
         raise ValueError(
             "Для in-memory режима обязательны df1 и df2 (DataFrame)."
         )
-    return InMemoryComparator(df1, df2, tolerance, schema, key_columns)   
+    return InMemoryComparator(df1, df2, tolerance, schema, key_columns,
+                              agg_func=agg_func, log_callback=log_callback)   

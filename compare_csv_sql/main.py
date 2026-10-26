@@ -281,7 +281,7 @@ def find_duplicate_rows(df: pd.DataFrame, key_columns: List[str]) -> pd.DataFram
 
 
 class SchemaEditorDialog(QDialog):
-    """Диалог для редактирования схемы"""
+    """Диалог для редактирования схемы (табличный формат)"""
     
     def __init__(self, schema_manager: SchemaManager, schema_name: str = "", 
                  schema_data: Dict = None, parent=None):
@@ -292,9 +292,10 @@ class SchemaEditorDialog(QDialog):
         self.result = None
         
         self.setWindowTitle(f"Редактирование схемы: {schema_name}" if schema_name else "Новая схема")
-        self.setMinimumSize(600, 550)
+        self.setMinimumSize(700, 600)
         
         self.init_ui()
+        self._load_data()
         
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -302,39 +303,54 @@ class SchemaEditorDialog(QDialog):
         # Имя схемы
         name_layout = QHBoxLayout()
         name_layout.addWidget(QLabel("Имя схемы:"))
-        self.name_edit = QLineEdit(self.schema_name)
+        self.name_edit = QLineEdit()
         name_layout.addWidget(self.name_edit)
         layout.addLayout(name_layout)
         
-        # Редактор схемы
-        layout.addWidget(QLabel("Столбцы (формат: имя:тип):"))
-        self.schema_edit = QTextEdit()
-        schema_text = "\n".join(
-            [f"{col}:{dtype}" for col, dtype in self.schema_data['schema'].items()]
-        )
-        self.schema_edit.setText(schema_text)
-        layout.addWidget(self.schema_edit)
-
-        # Ключевые столбцы
-        key_layout = QHBoxLayout()
-        key_layout.addWidget(QLabel("Ключевые столбцы (через запятую):"))
-        self.key_columns_edit = QLineEdit(
-            ", ".join(self.schema_data.get('key_columns', []))
-        )
-        key_layout.addWidget(self.key_columns_edit)
-        layout.addLayout(key_layout)        
+        # Таблица схемы
+        table_label = QLabel("Столбцы схемы:")
+        table_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(table_label)
+        
+        self.schema_table = QTableWidget()
+        self.schema_table.setColumnCount(3)
+        self.schema_table.setHorizontalHeaderLabels(["Имя столбца", "Тип", "Ключевой"])
+        self.schema_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.schema_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.schema_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.schema_table.setMinimumHeight(250)
+        layout.addWidget(self.schema_table)
+        
+        # Кнопки управления таблицей
+        table_buttons_layout = QHBoxLayout()
+        
+        btn_add_row = QPushButton("+ Добавить столбец")
+        btn_add_row.clicked.connect(self._add_row)
+        table_buttons_layout.addWidget(btn_add_row)
+        
+        btn_remove_row = QPushButton("− Удалить столбец")
+        btn_remove_row.clicked.connect(self._remove_row)
+        table_buttons_layout.addWidget(btn_remove_row)
+        
+        btn_move_up = QPushButton("↑ Вверх")
+        btn_move_up.clicked.connect(lambda: self._move_row(-1))
+        table_buttons_layout.addWidget(btn_move_up)
+        
+        btn_move_down = QPushButton("↓ Вниз")
+        btn_move_down.clicked.connect(lambda: self._move_row(1))
+        table_buttons_layout.addWidget(btn_move_down)
+        
+        table_buttons_layout.addStretch()
+        layout.addLayout(table_buttons_layout)
         
         # Точность
         tolerance_layout = QHBoxLayout()
         tolerance_layout.addWidget(QLabel("Точность сравнения (0 - точное совпадение):"))
         self.tolerance_spin = QSpinBox()
         self.tolerance_spin.setRange(0, 1000000)
-        tolerance_value = int(self.schema_data.get('tolerance', 0) * 1000000)
-        self.tolerance_spin.setValue(tolerance_value)
         self.tolerance_spin.setSuffix(" (10⁻⁶)")
         tolerance_layout.addWidget(self.tolerance_spin)
         layout.addLayout(tolerance_layout)
-
         
         # Информация о файле
         info_label = QLabel(f"Схемы сохраняются в: {self.schema_manager.get_schema_file_path()}")
@@ -349,6 +365,148 @@ class SchemaEditorDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         
+    def _load_data(self):
+        """Загрузка данных в таблицу"""
+        self.name_edit.setText(self.schema_name)
+        tolerance_value = int(self.schema_data.get('tolerance', 0) * 1000000)
+        self.tolerance_spin.setValue(tolerance_value)
+        
+        schema = self.schema_data.get('schema', {})
+        key_columns = self.schema_data.get('key_columns', [])
+        
+        for col_name, col_type in schema.items():
+            row = self.schema_table.rowCount()
+            self.schema_table.insertRow(row)
+            
+            # Имя столбца
+            name_item = QTableWidgetItem(col_name)
+            name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+            self.schema_table.setItem(row, 0, name_item)
+            
+            # Тип (combobox)
+            type_combo = QComboBox()
+            type_combo.addItems(["string", "float", "int", "bool"])
+            type_combo.setCurrentText(col_type)
+            self.schema_table.setCellWidget(row, 1, type_combo)
+            
+            # Чекбокс ключевого столбца
+            is_key = col_name in key_columns
+            key_checkbox = QCheckBox()
+            key_checkbox.setChecked(is_key)
+            key_widget = QWidget()
+            key_layout = QHBoxLayout(key_widget)
+            key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+            key_layout.addWidget(key_checkbox)
+            key_layout.setContentsMargins(0, 0, 0, 0)
+            self.schema_table.setCellWidget(row, 2, key_widget)
+    
+    def _add_row(self):
+        """Добавление новой строки"""
+        row = self.schema_table.rowCount()
+        self.schema_table.insertRow(row)
+        
+        name_item = QTableWidgetItem("")
+        name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+        self.schema_table.setItem(row, 0, name_item)
+        
+        type_combo = QComboBox()
+        type_combo.addItems(["string", "float", "int", "bool"])
+        type_combo.setCurrentText("string")
+        self.schema_table.setCellWidget(row, 1, type_combo)
+        
+        key_checkbox = QCheckBox()
+        key_checkbox.setChecked(False)
+        key_widget = QWidget()
+        key_layout = QHBoxLayout(key_widget)
+        key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+        key_layout.addWidget(key_checkbox)
+        key_layout.setContentsMargins(0, 0, 0, 0)
+        self.schema_table.setCellWidget(row, 2, key_widget)
+    
+    def _remove_row(self):
+        """Удаление выбранной строки"""
+        current_row = self.schema_table.currentRow()
+        if current_row >= 0:
+            self.schema_table.removeRow(current_row)
+        elif self.schema_table.rowCount() > 0:
+            self.schema_table.removeRow(0)
+    
+    def _move_row(self, direction: int):
+        """Перемещение строки вверх или вниз"""
+        current_row = self.schema_table.currentRow()
+        new_row = current_row + direction
+        
+        if new_row < 0 or new_row >= self.schema_table.rowCount():
+            return
+        
+        row_data = []
+        for col in range(3):
+            item = self.schema_table.item(current_row, col)
+            if item:
+                row_data.append(item.text())
+            else:
+                widget = self.schema_table.cellWidget(current_row, col)
+                if widget:
+                    if col == 1:
+                        row_data.append(widget.currentText())
+                    elif col == 2:
+                        row_data.append(widget.findChild(QCheckBox).isChecked())
+                else:
+                    row_data.append("")
+        
+        self.schema_table.removeRow(current_row)
+        self.schema_table.insertRow(new_row)
+        
+        for col in range(3):
+            if col == 0:
+                name_item = QTableWidgetItem(row_data[col])
+                name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+                self.schema_table.setItem(new_row, col, name_item)
+            elif col == 1:
+                type_combo = QComboBox()
+                type_combo.addItems(["string", "float", "int", "bool"])
+                type_combo.setCurrentText(row_data[col])
+                self.schema_table.setCellWidget(new_row, col, type_combo)
+            elif col == 2:
+                key_checkbox = QCheckBox()
+                key_checkbox.setChecked(row_data[col])
+                key_widget = QWidget()
+                key_layout = QHBoxLayout(key_widget)
+                key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+                key_layout.addWidget(key_checkbox)
+                key_layout.setContentsMargins(0, 0, 0, 0)
+                self.schema_table.setCellWidget(new_row, col, key_widget)
+        
+        self.schema_table.setCurrentCell(new_row, 0)
+    
+    def _get_schema_from_table(self) -> Dict[str, str]:
+        """Получение схемы из таблицы"""
+        schema = {}
+        for row in range(self.schema_table.rowCount()):
+            name_item = self.schema_table.item(row, 0)
+            if not name_item or not name_item.text().strip():
+                continue
+            
+            type_combo = self.schema_table.cellWidget(row, 1)
+            col_type = type_combo.currentText() if type_combo else "string"
+            
+            schema[name_item.text().strip()] = col_type
+        
+        return schema
+    
+    def _get_key_columns_from_table(self) -> List[str]:
+        """Получение ключевых столбцов из таблицы"""
+        key_columns = []
+        for row in range(self.schema_table.rowCount()):
+            key_widget = self.schema_table.cellWidget(row, 2)
+            if key_widget:
+                checkbox = key_widget.findChild(QCheckBox)
+                if checkbox and checkbox.isChecked():
+                    name_item = self.schema_table.item(row, 0)
+                    if name_item and name_item.text().strip():
+                        key_columns.append(name_item.text().strip())
+        return key_columns
+        
     def accept_schema(self):
         """Обработка подтверждения"""
         try:
@@ -357,20 +515,20 @@ class SchemaEditorDialog(QDialog):
                 QMessageBox.warning(self, "Предупреждение", "Введите имя схемы!")
                 return
             
-            # Парсим схему через утилиту
-            schema = parse_schema_text(self.schema_edit.toPlainText().strip())
+            # Получаем схему из таблицы
+            schema = self._get_schema_from_table()
+            
+            if not schema:
+                QMessageBox.warning(self, "Предупреждение", "Добавьте хотя бы один столбец!")
+                return
+            
+            # Получаем ключевые столбцы
+            key_columns = self._get_key_columns_from_table()
             
             # Получаем точность
             tolerance = self.tolerance_spin.value() / 1_000_000
-
-            #   +           
-            # Ключевые столбцы берём из текстового поля (ранее был NameError)
-            # +            
-            key_columns = [
-            # +
-                c.strip() for c in self.key_columns_edit.text().split(",")
-                if c.strip()
-            ]
+            
+            # Проверяем, что все ключевые столбцы есть в схеме
             missing = [c for c in key_columns if c not in schema]
             if missing:
                 QMessageBox.warning(
@@ -378,7 +536,6 @@ class SchemaEditorDialog(QDialog):
                     f"Ключевые столбцы отсутствуют в схеме: {', '.join(missing)}"
                 )
                 return
-            
             
             self.result = {
                 'name': name,
@@ -404,10 +561,12 @@ class CompareWorker(QThread):
     error = Signal(str)
     key_uniqueness_warning = Signal(str, str)
     progress_chunk = Signal(int, int)  # current, total — для чанковой загрузки
+    duplicates_found = Signal(str, pd.DataFrame)  # table_name, sample_df
     
     def __init__(self, df1, df2, schema, compare_columns, tolerance,
                  use_chunked=False, df1_path=None, df2_path=None,
-                 chunksize=50000, encoding='utf-8', csv_separator=','):
+                 chunksize=50000, encoding='utf-8', csv_separator=',',
+                 agg_func=None, log_callback=None):
         super().__init__()
         self.df1 = df1
         self.df2 = df2
@@ -420,6 +579,8 @@ class CompareWorker(QThread):
         self.chunksize = chunksize
         self.encoding = encoding
         self.csv_separator = csv_separator
+        self.agg_func = agg_func
+        self.log_callback = log_callback
     
     def _auto_detect_separator(self, file_path: str) -> str:
         """Автоопределение разделителя CSV файла"""
@@ -461,12 +622,33 @@ class CompareWorker(QThread):
                 df2_path=self.df2_path,
                 chunksize=self.chunksize,
                 encoding=self.encoding,
-                separator=csv_separator
+                separator=csv_separator,
+                agg_func=self.agg_func,
+                log_callback=self.log_callback
             )
 
             if self.use_chunked:
                 self.progress.emit("Загрузка данных в БД (чанками)...")
                 comparator.load_data()
+
+                # Автоматическая проверка уникальности ключей
+                self.progress.emit("Проверка уникальности ключей...")
+                try:
+                    uniqueness_results, dup_samples = comparator.check_uniqueness()
+                    
+                    for table_name, result in uniqueness_results.items():
+                        if not result['unique']:
+                            # Отправляем предупреждение в UI
+                            msg = f"Обнаружены неуникальные ключи в {table_name}: {result['dup_keys']} ключей ({result['dup_rows']} строк)"
+                            self.key_uniqueness_warning.emit(msg, "")
+                            
+                            # Показываем примеры дубликатов через сигнал
+                            for sample_table, sample_df in dup_samples:
+                                if sample_table == table_name and not sample_df.empty:
+                                    self.duplicates_found.emit(table_name, sample_df)
+                except Exception as e:
+                    self.log_callback(f"  ⚠️ Ошибка проверки уникальности: {e}")
+                    # Продолжаем сравнение даже при ошибке проверки
 
             self.progress.emit("Выполнение сравнения...")
             if self.use_chunked:
@@ -500,6 +682,7 @@ class MainWindow(QMainWindow):
         self.schema_manager = SchemaManager()
         self.key_uniqueness_warnings = []
         self.worker = None  # Сохраняем ссылку на worker для hotkeys и closeEvent
+        self.max_display_rows = 10000  # Лимит отображения строк в UI
 
         self.init_ui()
         self._load_schema_list()
@@ -1602,54 +1785,18 @@ class MainWindow(QMainWindow):
         tolerance = self.tolerance_spin.value() / 1_000_000
 
         # --- АГРЕГАЦИЯ (если включена) ---
-        df1_to_compare = self.df1
-        df2_to_compare = self.df2
-
-        # if self.agg_checkbox.isChecked() and not self.chunked_checkbox.isChecked():
-        #     agg_func = self.agg_func_combo.currentText()
-        #     self.log("Агрегация дубликатов включена (функция: {})".format(agg_func))
-
-        #     agg_df1, err1 = self._aggregate_duplicates(self.df1, self.current_compare_columns, agg_func)
-        #     if err1:
-        #         self.log(f"⚠️ df1: {err1}. Агрегация пропущена.", is_error=False)
-        #     else:
-        #         df1_to_compare = agg_df1
-        #         self.log(f"✓ df1 агрегирован: {len(self.df1)} → {len(df1_to_compare)} строк")
-
-        #     agg_df2, err2 = self._aggregate_duplicates(self.df2, self.current_compare_columns, agg_func)
-        #     if err2:
-        #         self.log(f"⚠️ df2: {err2}. Агрегация пропущена.", is_error=False)
-        #     else:
-        #         df2_to_compare = agg_df2
-        #         self.log(f"✓ df2 агрегирован: {len(self.df2)} → {len(df2_to_compare)} строк")
+        # Агрегация выполняется внутри компаратора (InMemoryComparator или ChunkedComparator)
 
         if self.agg_checkbox.isChecked():
+            agg_func = self.agg_func_combo.currentText()
+            self.log("Агрегация дубликатов включена (функция: {})".format(agg_func))
+
             if self.chunked_checkbox.isChecked():
-                # Явно сообщаем, что агрегация не поддерживается
-                QMessageBox.warning(
-                    self, "Агрегация недоступна",
-                    "Агрегация дубликатов не поддерживается в чанковом режиме.\n"
-                    "Сравнение будет выполнено БЕЗ агрегации.\n\n"
-                    "Отключите чанковый режим, если нужна агрегация."
-                )
-                self.log("⚠️ Агрегация не поддерживается в чанковом режиме — пропущена")
+                # В чанковом режиме агрегация выполняется внутри ChunkedComparator
+                self.log("  Агрегация будет выполнена в чанковом режиме после загрузки")
             else:
-                agg_func = self.agg_func_combo.currentText()
-                self.log("Агрегация дубликатов включена (функция: {})".format(agg_func))
-
-                agg_df1, err1 = self._aggregate_duplicates(self.df1, self.current_compare_columns, agg_func)
-                if err1:
-                    self.log(f"⚠️ df1: {err1}. Агрегация пропущена.", is_error=False)
-                else:
-                    df1_to_compare = agg_df1
-                    self.log(f"✓ df1 агрегирован: {len(self.df1)} → {len(df1_to_compare)} строк")
-
-                agg_df2, err2 = self._aggregate_duplicates(self.df2, self.current_compare_columns, agg_func)
-                if err2:
-                    self.log(f"⚠️ df2: {err2}. Агрегация пропущена.", is_error=False)
-                else:
-                    df2_to_compare = agg_df2
-                    self.log(f"✓ df2 агрегирован: {len(self.df2)} → {len(df2_to_compare)} строк")
+                # В in-memory режиме агрегация выполняется внутри InMemoryComparator
+                self.log("  Агрегация будет выполнена в in-memory режиме перед сравнением")
 
     
         # --- КОНЕЦ АГРЕГАЦИИ ---
@@ -1682,11 +1829,12 @@ class MainWindow(QMainWindow):
             df1_path = self.file1_path.text()
             df2_path = self.file2_path.text()
         else:
-            df1_worker = df1_to_compare
-            df2_worker = df2_to_compare
+            df1_worker = self.df1
+            df2_worker = self.df2
             df1_path = None
             df2_path = None
         sep = self.sep_combo.currentText()
+        agg_func = self.agg_func_combo.currentText() if self.agg_checkbox.isChecked() else None
         self.worker = CompareWorker(
             df1_worker, df2_worker,
             self.current_schema,
@@ -1697,13 +1845,16 @@ class MainWindow(QMainWindow):
             df2_path=df2_path,
             chunksize=self.chunksize_spin.value(),
             encoding='utf-8',
-            csv_separator=sep 
+            csv_separator=sep,
+            agg_func=agg_func,
+            log_callback=self.log  # передаём метод log для вывода в UI
         )
         self.worker.progress.connect(self.log)
         self.worker.finished.connect(self._on_comparison_finished)
         self.worker.error.connect(self._on_comparison_error)
         self.worker.key_uniqueness_warning.connect(self._on_key_uniqueness_warning)
         self.worker.progress_chunk.connect(self._on_chunk_progress)
+        self.worker.duplicates_found.connect(self._on_duplicates_found)
         self.worker.start()
     
     def _on_chunk_progress(self, current: int, total: int):
@@ -1714,51 +1865,40 @@ class MainWindow(QMainWindow):
             self.log(f"  Загрузка: {current}/{total} чанков ({percent}%)")
 
     def _on_key_uniqueness_warning(self, message: str, details: str):
-        """Обработка предупреждения о неуникальных ключах"""
+        """Обработка предупреждения о неуникальных ключах (неблокирующая)"""
         self.key_uniqueness_warnings.append((message, details))
         self.log(f"⚠️ {message}", is_error=False)
-        
-        # Показываем диалог с предупреждением
-        reply = QMessageBox.warning(
-            self, "Предупреждение о неуникальных ключах",
-            f"{message}\n\n"
-            f"Сравнение будет продолжено, но результаты могут быть некорректными.\n\n"
-            f"Хотите просмотреть детали?",
-            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-            QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
-            # Показываем детали в отдельном диалоге
-            detail_dialog = QDialog(self)
-            detail_dialog.setWindowTitle("Детали неуникальных ключей")
-            detail_dialog.setMinimumSize(800, 600)
-            
-            layout = QVBoxLayout(detail_dialog)
-            
-            text_edit = QTextEdit()
-            text_edit.setReadOnly(True)
-            text_edit.setText(details)
-            font = QFont("Courier New", 9)
-            text_edit.setFont(font)
-            layout.addWidget(text_edit)
-            
-            buttons = QDialogButtonBox(QDialogButtonBox.Close)
-            buttons.rejected.connect(detail_dialog.close)
-            layout.addWidget(buttons)
-            
-            detail_dialog.exec()
-        elif reply == QMessageBox.Cancel:
-            self.worker.terminate()
-            return
+        # Не показываем диалог здесь — он будет показан после завершения сравнения
+        # Это предотвращает deadlock при вызове из потока
 
+    def _on_duplicates_found(self, table_name: str, sample_df: pd.DataFrame):
+        """Обработка найденных дубликатов из чанкового режима"""
+        # Показываем дубликаты в вкладке результатов
+        self._show_duplicates_table(sample_df, f"Дубликаты в {table_name}")
+    
     def _on_comparison_finished(self, comparator):
-        """Обработка завершения сравнения (без изменений)"""
+        """Обработка завершения сравнения"""
         self.comparator = comparator
         self.progress_bar.hide()
         self.btn_compare.setEnabled(True)
         self.btn_save.setEnabled(True)
         self._display_results()
+
+        # Показываем предупреждения об уникальности (если были)
+        if self.key_uniqueness_warnings:
+            warning_text = "\n\n".join([msg for msg, _ in self.key_uniqueness_warnings])
+            reply = QMessageBox.warning(
+                self, "Предупреждение о неуникальных ключах",
+                f"Обнаружены неуникальные ключи:\n\n{warning_text}\n\n"
+                f"Сравнение будет продолжено, но результаты могут быть некорректными.\n\n"
+                f"Хотите просмотреть детали дубликатов?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # Показываем все вкладки с дубликатами (они уже добавлены через _on_duplicates_found)
+                pass  # Вкладки с дубликатами уже добавлены в results_tabs
 
         total_diffs = 0
         if not comparator.df1_only.empty:
@@ -1809,8 +1949,15 @@ class MainWindow(QMainWindow):
         
         # Таблица "Только в df1"
         if not self.comparator.df1_only.empty:
-            tab1 = self._create_table_widget(self.comparator.df1_only)
-            self.results_tabs.addTab(tab1, f"Только в df1 ({len(self.comparator.df1_only)})")
+            is_chunked = hasattr(self.comparator, '_truncated_df1_only')
+            if is_chunked and self.comparator._truncated_df1_only:
+                info_text = f"Показаны первые {len(self.comparator.df1_only)} строк (усечено из M, чанковый режим)"
+            else:
+                info_text = None
+            tab1 = self._create_table_widget(self.comparator.df1_only, self.max_display_rows, info_text)
+            truncated = is_chunked and self.comparator._truncated_df1_only
+            tab_title = f"⚠ " if truncated else ""
+            self.results_tabs.addTab(tab1, f"{tab_title}Только в df1 ({len(self.comparator.df1_only)})")
         else:
             tab1 = QWidget()
             tab1_layout = QVBoxLayout(tab1)
@@ -1819,8 +1966,15 @@ class MainWindow(QMainWindow):
         
         # Таблица "Только в df2"
         if not self.comparator.df2_only.empty:
-            tab2 = self._create_table_widget(self.comparator.df2_only)
-            self.results_tabs.addTab(tab2, f"Только в df2 ({len(self.comparator.df2_only)})")
+            is_chunked = hasattr(self.comparator, '_truncated_df2_only')
+            if is_chunked and self.comparator._truncated_df2_only:
+                info_text = f"Показаны первые {len(self.comparator.df2_only)} строк (усечено из M, чанковый режим)"
+            else:
+                info_text = None
+            tab2 = self._create_table_widget(self.comparator.df2_only, self.max_display_rows, info_text)
+            truncated = is_chunked and self.comparator._truncated_df2_only
+            tab_title = f"⚠ " if truncated else ""
+            self.results_tabs.addTab(tab2, f"{tab_title}Только в df2 ({len(self.comparator.df2_only)})")
         else:
             tab2 = QWidget()
             tab2_layout = QVBoxLayout(tab2)
@@ -1829,8 +1983,15 @@ class MainWindow(QMainWindow):
         
         # Таблица "Различия в значениях"
         if self.comparator.df1_df2_value is not None and not self.comparator.df1_df2_value.empty:
-            tab3 = self._create_table_widget(self.comparator.df1_df2_value)
-            self.results_tabs.addTab(tab3, f"Различия ({len(self.comparator.df1_df2_value)})")
+            is_chunked = hasattr(self.comparator, '_truncated_df1_df2_value')
+            if is_chunked and self.comparator._truncated_df1_df2_value:
+                info_text = f"Показаны первые {len(self.comparator.df1_df2_value)} строк (усечено из M, чанковый режим)"
+            else:
+                info_text = None
+            tab3 = self._create_table_widget(self.comparator.df1_df2_value, self.max_display_rows, info_text)
+            truncated = is_chunked and self.comparator._truncated_df1_df2_value
+            tab_title = f"⚠ " if truncated else ""
+            self.results_tabs.addTab(tab3, f"{tab_title}Различия ({len(self.comparator.df1_df2_value)})")
         else:
             tab3 = QWidget()
             tab3_layout = QVBoxLayout(tab3)
@@ -1858,21 +2019,42 @@ class MainWindow(QMainWindow):
             self.results_tabs.addTab(warning_widget, f"⚠ Предупреждения ({len(self.key_uniqueness_warnings)})")
     
 
-    def _create_table_widget(self, df: pd.DataFrame) -> QWidget:
-        """Создание виджета таблицы из DataFrame с подсветкой различий"""
+    def _create_table_widget(self, df: pd.DataFrame, max_display_rows: int = None, info_text_override: str = None) -> QWidget:
+        """Создание виджета таблицы из DataFrame с подсветкой различий
+        
+        Args:
+            df: DataFrame для отображения
+            max_display_rows: лимит отображения строк (по умолчанию self.max_display_rows)
+            info_text_override: если задан, заменяет автоматический info label
+        """
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
+        # Применяем лимит отображения (in-memory режим)
+        # В chunked-режиме df уже усечён в compare(), поэтому head() — безопасен
+        if max_display_rows is None:
+            max_display_rows = self.max_display_rows
+        total_rows = len(df)
+        display_df = df.head(max_display_rows) if len(df) > max_display_rows else df
+        
         # Информация о таблице
-        info_label = QLabel(f"Строк: {len(df)}, Столбцов: {len(df.columns)}")
+        if info_text_override:
+            info_label = QLabel(info_text_override)
+        elif total_rows > max_display_rows:
+            info_label = QLabel(
+                f"Показаны первые {len(display_df)} из {total_rows} строк, "
+                f"Столбцов: {len(df.columns)}"
+            )
+        else:
+            info_label = QLabel(f"Строк: {len(df)}, Столбцов: {len(df.columns)}")
         info_label.setStyleSheet("font-weight: bold; padding: 5px;")
         layout.addWidget(info_label)
         
         # Таблица
         table = QTableWidget()
-        table.setColumnCount(len(df.columns))
-        table.setHorizontalHeaderLabels(df.columns.tolist())
-        table.setRowCount(len(df))
+        table.setColumnCount(len(display_df.columns))
+        table.setHorizontalHeaderLabels(display_df.columns.tolist())
+        table.setRowCount(len(display_df))
         
         # Определяем пары столбцов для сравнения (без суффиксов _df1 и _df2)
         column_pairs = []
@@ -1894,8 +2076,8 @@ class MainWindow(QMainWindow):
             if df1_col in df.columns and df2_col in df.columns:
                 col_mapping[base_name] = (df1_col, df2_col)
         
-        for row_idx, (_, row) in enumerate(df.iterrows()):
-            for col_idx, col_name in enumerate(df.columns):
+        for row_idx, (_, row) in enumerate(display_df.iterrows()):
+            for col_idx, col_name in enumerate(display_df.columns):
                 value = str(row[col_name]) if pd.notna(row[col_name]) else ""
                 item = QTableWidgetItem(value)
                 # Подсветка сравниваемых столбцов
