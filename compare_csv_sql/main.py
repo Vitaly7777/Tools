@@ -1,6 +1,8 @@
 import sys
 import os
 import json
+import hashlib
+import sqlite3
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime
@@ -313,13 +315,6 @@ class SchemaEditorDialog(QDialog):
         self.schema_edit.setText(schema_text)
         layout.addWidget(self.schema_edit)
         
-        # Ключевые столбцы
-        layout.addWidget(QLabel("Ключевые столбцы (через запятую):"))
-        self.key_columns_edit = QLineEdit()
-        if self.schema_data['key_columns']:
-            self.key_columns_edit.setText(", ".join(self.schema_data['key_columns']))
-        layout.addWidget(self.key_columns_edit)
-        
         # Точность
         tolerance_layout = QHBoxLayout()
         tolerance_layout.addWidget(QLabel("Точность сравнения (0 - точное совпадение):"))
@@ -354,19 +349,7 @@ class SchemaEditorDialog(QDialog):
                 return
             
             # Парсим схему через утилиту
-            schema = parse_schema_text(schema_text)
-            
-            # Парсим ключевые столбцы через утилиту
-            key_columns = parse_key_columns(self.key_columns_edit.text())
-            
-            # Проверяем, что все ключевые столбцы есть в схеме
-            for col in key_columns:
-                if col not in schema:
-                    QMessageBox.warning(
-                        self, "Предупреждение",
-                        f"Ключевой столбец '{col}' не найден в схеме!"
-                    )
-                    return
+            schema = parse_schema_text(self.schema_edit.toPlainText().strip())
             
             # Получаем точность
             tolerance = self.tolerance_spin.value() / 1_000_000
@@ -394,7 +377,8 @@ class CompareWorker(QThread):
     finished = Signal(object)
     error = Signal(str)
     key_uniqueness_warning = Signal(str, str)
-
+    progress_chunk = Signal(int, int)  # current, total — для чанковой загрузки
+    
     def __init__(self, df1, df2, schema, compare_columns, tolerance,
                  use_chunked=False, df1_path=None, df2_path=None,
                  chunksize=50000, encoding='utf-8', csv_separator=','):
@@ -411,10 +395,35 @@ class CompareWorker(QThread):
         self.encoding = encoding
         self.csv_separator = csv_separator
     
+    def _auto_detect_separator(self, file_path: str) -> str:
+        """Автоопределение разделителя CSV файла"""
+        try:
+            with open(file_path, 'r', encoding=self.encoding) as f:
+                sample = f.read(8192)
+            candidates = {
+                ',': sample.count(','),
+                ';': sample.count(';'),
+                '\t': sample.count('\t'),
+                '|': sample.count('|')
+            }
+            best_sep = max(candidates, key=candidates.get)
+            if candidates[best_sep] >= 3:
+                return best_sep
+        except Exception:
+            pass
+        return ','
+    
     def run(self):
         comparator = None 
         try:
             self.progress.emit("Создание компаратора...")
+            
+            # Автоопределение разделителя для чанкового режима
+            csv_separator = self.csv_separator
+            if self.use_chunked and self.df1_path:
+                csv_separator = self._auto_detect_separator(self.df1_path)
+                self.progress.emit(f"  Разделитель определён: '{csv_separator}'")
+            
             # ИСПОЛЬЗУЕМ ФАБРИКУ
             comparator = create_comparator(
                 self.df1, self.df2,
@@ -426,7 +435,7 @@ class CompareWorker(QThread):
                 df2_path=self.df2_path,
                 chunksize=self.chunksize,
                 encoding=self.encoding,
-                separator=self.csv_separator
+                separator=csv_separator
             )
 
             if self.use_chunked:
@@ -435,12 +444,8 @@ class CompareWorker(QThread):
 
             self.progress.emit("Выполнение сравнения...")
             if self.use_chunked:
-                # Чанковый компаратор: compare() заполняет атрибуты
                 comparator.compare()
-                # Для единообразия сохраняем результаты в те же поля
-                # (они уже есть)
             else:
-                # In-memory компаратор
                 comparator.compare()
 
             self.progress.emit("Сравнение завершено!")
@@ -449,7 +454,6 @@ class CompareWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
         finally:
-            # Закрываем соединение с БД, если оно есть
             if hasattr(comparator, 'close'):
                 comparator.close()
 
@@ -466,12 +470,14 @@ class MainWindow(QMainWindow):
         self.current_schema = {}
         self.current_compare_columns = []
         self.current_tolerance = 0.0
-        self.output_dir = Path("./tmp/Results/compare_csv")
+        self.output_dir = Path("./tmp/Results/compare_csv").resolve()
         self.schema_manager = SchemaManager()
         self.key_uniqueness_warnings = []
+        self.worker = None  # Сохраняем ссылку на worker для hotkeys и closeEvent
 
         self.init_ui()
         self._load_schema_list()
+        self._load_last_session()
 
         if self.schema_combo.count() > 0:
             self.apply_schema_template(self.schema_combo.currentText())
@@ -519,6 +525,35 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.progress_bar)
 
         self._update_button_states()
+        
+        # Горячие клавиши
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        """Настройка горячих клавиш"""
+        # Ctrl+O — открыть файл 1
+        open_action = QAction("Ctrl+O", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(lambda: self._select_file(1))
+        self.addAction(open_action)
+        
+        # Ctrl+Shift+O — открыть файл 2
+        open_action2 = QAction("Ctrl+Shift+O", self)
+        open_action2.setShortcut("Ctrl+Shift+O")
+        open_action2.triggered.connect(lambda: self._select_file(2))
+        self.addAction(open_action2)
+        
+        # Ctrl+S — сохранить результаты
+        save_action = QAction("Ctrl+S", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self._save_results)
+        self.addAction(save_action)
+        
+        # Ctrl+R — запустить сравнение
+        compare_action = QAction("Ctrl+R", self)
+        compare_action.setShortcut("Ctrl+R")
+        compare_action.triggered.connect(self._start_comparison)
+        self.addAction(compare_action)
 
     def _create_menu(self):
         """Создание меню"""
@@ -609,7 +644,19 @@ class MainWindow(QMainWindow):
         self.sep_combo = QComboBox()
         self.sep_combo.addItems([",", ";", "\t", "|"])
         self.sep_combo.setCurrentText(",")
+        self.sep_combo.setEditable(True)  # Пользователь может ввести свой разделитель
         sep_layout.addWidget(self.sep_combo)
+        
+        # Автоопределение разделителя
+        self.sep_auto_checkbox = QCheckBox("Авто")
+        self.sep_auto_checkbox.setChecked(False)
+        sep_layout.addWidget(self.sep_auto_checkbox)
+        
+        self.sep_auto_label = QLabel("")
+        self.sep_auto_label.setStyleSheet("color: #2196F3; font-weight: bold;")
+        self.sep_auto_label.setMaximumWidth(80)
+        sep_layout.addWidget(self.sep_auto_label)
+        
         sep_layout.addStretch()
         layout.addLayout(sep_layout)
 
@@ -647,22 +694,45 @@ class MainWindow(QMainWindow):
 
         schema_layout.addLayout(template_layout)
 
-        # Редактор схемы
-        schema_layout.addWidget(QLabel("Столбцы (имя:тип):"))
-        self.schema_editor = QTextEdit()
-        self.schema_editor.setMaximumHeight(100)
-        self.schema_editor.setPlaceholderText(
-            "Формат: столбец:тип\nНапример:\nКод ЦФО:string\nЗначение:float"
-        )
-        schema_layout.addWidget(self.schema_editor)
-
-        # Ключевые столбцы
-        schema_layout.addWidget(QLabel("Ключевые столбцы (через запятую):"))
-        self.key_columns_edit = QLineEdit()
-        self.key_columns_edit.setPlaceholderText(
-            "Код ЦФО, Статья Hyperion Forecast, ..."
-        )
-        schema_layout.addWidget(self.key_columns_edit)
+        # Редактор схемы — таблица
+        schema_table_layout = QHBoxLayout()
+        schema_table_layout.addWidget(QLabel("Столбцы:"))
+        
+        self.schema_table = QTableWidget()
+        self.schema_table.setColumnCount(3)
+        self.schema_table.setHorizontalHeaderLabels(["Имя столбца", "Тип", "Ключевой"])
+        self.schema_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.schema_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.schema_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.schema_table.setMinimumHeight(150)
+        schema_table_layout.addWidget(self.schema_table)
+        
+        # Кнопки управления таблицей
+        table_buttons_layout = QVBoxLayout()
+        btn_add_col = QPushButton("+")
+        btn_add_col.setMaximumWidth(30)
+        btn_add_col.clicked.connect(self._add_schema_column)
+        table_buttons_layout.addWidget(btn_add_col)
+        
+        btn_remove_col = QPushButton("−")
+        btn_remove_col.setMaximumWidth(30)
+        btn_remove_col.clicked.connect(self._remove_schema_column)
+        table_buttons_layout.addWidget(btn_remove_col)
+        
+        btn_move_up = QPushButton("↑")
+        btn_move_up.setMaximumWidth(30)
+        btn_move_up.clicked.connect(lambda: self._move_schema_column(-1))
+        table_buttons_layout.addWidget(btn_move_up)
+        
+        btn_move_down = QPushButton("↓")
+        btn_move_down.setMaximumWidth(30)
+        btn_move_down.clicked.connect(lambda: self._move_schema_column(1))
+        table_buttons_layout.addWidget(btn_move_down)
+        
+        table_buttons_layout.addStretch()
+        schema_table_layout.addLayout(table_buttons_layout)
+        
+        schema_layout.addLayout(schema_table_layout)
 
         # Кнопки для схемы
         schema_buttons = QHBoxLayout()
@@ -769,38 +839,175 @@ class MainWindow(QMainWindow):
 
         return group
 
+    def _add_schema_column(self):
+        """Добавление столбца в таблицу схемы"""
+        row = self.schema_table.rowCount()
+        self.schema_table.insertRow(row)
+        
+        name_item = QTableWidgetItem("")
+        name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+        self.schema_table.setItem(row, 0, name_item)
+        
+        type_combo = QComboBox()
+        type_combo.addItems(["string", "float", "int", "bool"])
+        type_combo.setCurrentText("string")
+        self.schema_table.setCellWidget(row, 1, type_combo)
+        
+        key_checkbox = QCheckBox()
+        key_checkbox.setChecked(False)
+        key_widget = QWidget()
+        key_layout = QHBoxLayout(key_widget)
+        key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+        key_layout.addWidget(key_checkbox)
+        key_layout.setContentsMargins(0, 0, 0, 0)
+        self.schema_table.setCellWidget(row, 2, key_widget)
+    
+    def _remove_schema_column(self):
+        """Удаление выбранного столбца из таблицы схемы"""
+        current_row = self.schema_table.currentRow()
+        if current_row >= 0:
+            self.schema_table.removeRow(current_row)
+    
+    def _move_schema_column(self, direction: int):
+        """Перемещение столбца вверх или вниз"""
+        current_row = self.schema_table.currentRow()
+        new_row = current_row + direction
+        
+        if new_row < 0 or new_row >= self.schema_table.rowCount():
+            return
+        
+        row_data = []
+        for col in range(3):
+            item = self.schema_table.item(current_row, col)
+            if item:
+                row_data.append(item.text())
+            else:
+                widget = self.schema_table.cellWidget(current_row, col)
+                if widget:
+                    if col == 1:
+                        row_data.append(widget.currentText())
+                    elif col == 2:
+                        row_data.append(widget.findChild(QCheckBox).isChecked())
+                else:
+                    row_data.append("")
+        
+        self.schema_table.removeRow(current_row)
+        self.schema_table.insertRow(new_row)
+        
+        for col in range(3):
+            if col == 0:
+                name_item = QTableWidgetItem(row_data[col])
+                name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+                self.schema_table.setItem(new_row, col, name_item)
+            elif col == 1:
+                type_combo = QComboBox()
+                type_combo.addItems(["string", "float", "int", "bool"])
+                type_combo.setCurrentText(row_data[col])
+                self.schema_table.setCellWidget(new_row, col, type_combo)
+            elif col == 2:
+                key_checkbox = QCheckBox()
+                key_checkbox.setChecked(row_data[col])
+                key_widget = QWidget()
+                key_layout = QHBoxLayout(key_widget)
+                key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+                key_layout.addWidget(key_checkbox)
+                key_layout.setContentsMargins(0, 0, 0, 0)
+                self.schema_table.setCellWidget(new_row, col, key_widget)
+        
+        self.schema_table.setCurrentCell(new_row, 0)
+    
+    def _get_schema_from_table(self) -> Dict[str, str]:
+        """Получение схемы из таблицы"""
+        schema = {}
+        for row in range(self.schema_table.rowCount()):
+            name_item = self.schema_table.item(row, 0)
+            if not name_item or not name_item.text().strip():
+                continue
+            
+            type_combo = self.schema_table.cellWidget(row, 1)
+            col_type = type_combo.currentText() if type_combo else "string"
+            
+            schema[name_item.text().strip()] = col_type
+        
+        return schema
+    
+    def _get_key_columns_from_table(self) -> List[str]:
+        """Получение ключевых столбцов из таблицы"""
+        key_columns = []
+        for row in range(self.schema_table.rowCount()):
+            key_widget = self.schema_table.cellWidget(row, 2)
+            if key_widget:
+                checkbox = key_widget.findChild(QCheckBox)
+                if checkbox and checkbox.isChecked():
+                    name_item = self.schema_table.item(row, 0)
+                    if name_item and name_item.text().strip():
+                        key_columns.append(name_item.text().strip())
+        return key_columns
+    
+    def _set_schema_to_table(self, schema: Dict[str, str], key_columns: List[str] = None):
+        """Установка схемы в таблицу"""
+        self.schema_table.setRowCount(0)
+        
+        for col_name, col_type in schema.items():
+            row = self.schema_table.rowCount()
+            self.schema_table.insertRow(row)
+            
+            name_item = QTableWidgetItem(col_name)
+            name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+            self.schema_table.setItem(row, 0, name_item)
+            
+            type_combo = QComboBox()
+            type_combo.addItems(["string", "float", "int", "bool"])
+            type_combo.setCurrentText(col_type)
+            self.schema_table.setCellWidget(row, 1, type_combo)
+            
+            is_key = key_columns and col_name in key_columns
+            key_checkbox = QCheckBox()
+            key_checkbox.setChecked(is_key)
+            key_widget = QWidget()
+            key_layout = QHBoxLayout(key_widget)
+            key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+            key_layout.addWidget(key_checkbox)
+            key_layout.setContentsMargins(0, 0, 0, 0)
+            self.schema_table.setCellWidget(row, 2, key_widget)
+
     def _check_key_uniqueness_manual(self):
         """Ручная проверка уникальности ключей"""
-        if self.df1 is None or self.df2 is None:
-            QMessageBox.warning(self, "Предупреждение", "Сначала загрузите файлы!")
+        self.log("Начата проверка уникальности ключей...")
+        QApplication.processEvents()  # Обновляем UI перед длительной операцией
+        
+        key_columns = self._get_key_columns_from_table()
+        if not key_columns:
+            QMessageBox.warning(self, "Предупреждение", "Ключевые столбцы не указаны в таблице схемы!")
             return
         
-        key_text = self.key_columns_edit.text().strip()
-        if not key_text:
-            QMessageBox.warning(self, "Предупреждение", "Укажите ключевые столбцы!")
-            return
+        use_chunked = self.chunked_checkbox.isChecked()
         
-        key_columns = [col.strip() for col in key_text.split(",")]
-        
-        # Проверяем df1
+        if use_chunked:
+            # Чанковый режим: проверяем уникальность напрямую из CSV через SQLite
+            self._check_uniqueness_chunked(key_columns)
+        else:
+            # In-memory режим: используем загруженные датафреймы
+            if self.df1 is None or self.df2 is None:
+                QMessageBox.warning(self, "Предупреждение", "Сначала загрузите файлы!")
+                return
+            self._check_uniqueness_in_memory(key_columns)
+
+    def _check_uniqueness_in_memory(self, key_columns: List[str]):
+        """Проверка уникальности для загруженных в память датафреймов"""
         is_unique_1, dup_keys_1 = check_key_uniqueness(self.df1, key_columns, "df1")
         if not is_unique_1:
             duplicates_df1 = find_duplicate_rows(self.df1, key_columns)
             self.log(f"⚠️ В df1 обнаружено {len(dup_keys_1)} неуникальных ключей")
-            
-            # Показываем таблицу с дубликатами
             if not duplicates_df1.empty:
                 self._show_duplicates_table(duplicates_df1, "Дубликаты в df1")
         else:
             self.log("✓ Ключи в df1 уникальны")
         
-        # Проверяем df2
         is_unique_2, dup_keys_2 = check_key_uniqueness(self.df2, key_columns, "df2")
         if not is_unique_2:
             duplicates_df2 = find_duplicate_rows(self.df2, key_columns)
             self.log(f"⚠️ В df2 обнаружено {len(dup_keys_2)} неуникальных ключей")
-            
-            # Показываем таблицу с дубликатами
             if not duplicates_df2.empty:
                 self._show_duplicates_table(duplicates_df2, "Дубликаты в df2")
         else:
@@ -808,6 +1015,71 @@ class MainWindow(QMainWindow):
         
         if is_unique_1 and is_unique_2:
             QMessageBox.information(self, "Уникальность ключей", "Ключи уникальны в обоих датафреймах!")
+
+    def _check_uniqueness_chunked(self, key_columns: List[str]):
+        """Проверка уникальности ключей напрямую из CSV-файлов через SQLite"""
+        path1 = self.file1_path.text().strip()
+        path2 = self.file2_path.text().strip()
+        
+        if not path1 or not path2:
+            QMessageBox.warning(self, "Предупреждение", "Укажите пути к обоим файлам!")
+            return
+        if not os.path.exists(path1):
+            QMessageBox.critical(self, "Ошибка", f"Файл не найден: {path1}")
+            return
+        if not os.path.exists(path2):
+            QMessageBox.critical(self, "Ошибка", f"Файл не найден: {path2}")
+            return
+        
+        # Определяем разделитель
+        sep = self.sep_combo.currentText()
+        if self.sep_auto_checkbox.isChecked():
+            sep = self._auto_detect_separator(path1) or ","
+        
+        conn = sqlite3.connect(":memory:")
+        try:
+            for file_path, label in [(path1, "первого файла"), (path2, "второго файла")]:
+                self.log(f"  Загрузка {label}...")
+                try:
+                    df = pd.read_csv(file_path, usecols=key_columns, dtype=str, encoding='utf-8', sep=sep)
+                except Exception as e:
+                    self.log(f"  ⚠️ Не удалось прочитать столбцы {key_columns} из {file_path}: {e}", is_error=True)
+                    continue
+                
+                if df.empty:
+                    self.log(f"  ⚠️ {label} пуст")
+                    continue
+                
+                # Создаём составной ключ
+                df['_key'] = df[key_columns].astype(str).agg(lambda row: '\x01'.join(row.astype(str)), axis=1)
+                
+                # Ищем дубликаты
+                dups = df[df['_key'].duplicated(keep=False)]
+                
+                if dups.empty:
+                    self.log(f"  ✓ {label}: ключи уникальны ({len(df)} строк)")
+                else:
+                    dup_keys_df = dups['_key'].value_counts().reset_index()
+                    dup_keys_df.columns = ['key', 'count']
+                    total_dup_keys = len(dup_keys_df)
+                    total_dup_rows = len(dups)
+                    self.log(f"  ⚠️ {label}: обнаружено {total_dup_keys} неуникальных ключей ({total_dup_rows} строк)", is_error=True)
+                    
+                    # Показываем первые 50 неуникальных ключей
+                    preview = dup_keys_df.head(50)
+                    lines = [f"    {'Ключ':<60} {'Кол-во':>6}"]
+                    lines += [f"    {row['key']:<60} {row['count']:>6}" for _, row in preview.iterrows()]
+                    if len(dup_keys_df) > 50:
+                        lines.append(f"    ... и ещё {len(dup_keys_df) - 50} ключей")
+                    self.log("\n".join(lines))
+                    
+                    # Показываем примеры дублирующихся строк
+                    sample = dups.head(20).drop(columns=['_key'])
+                    self._show_duplicates_table(sample, f"Дубликаты в {label}")
+            
+            QMessageBox.information(self, "Уникальность ключей", "Проверка завершена. Результаты в логе.")
+        finally:
+            conn.close()
 
     def _show_duplicates_table(self, duplicates_df: pd.DataFrame, title: str):
         """Отображение таблицы с дубликатами"""
@@ -889,15 +1161,8 @@ class MainWindow(QMainWindow):
         self.current_compare_columns = schema_data.get('key_columns', []).copy()
         self.current_tolerance = schema_data.get('tolerance', 0.0)
         
-        # Отображаем схему в редакторе
-        schema_text = "\n".join(
-            [f"{col}:{dtype}" for col, dtype in self.current_schema.items()]
-        )
-        self.schema_editor.setText(schema_text)
-        
-        # Отображаем ключевые столбцы
-        if self.current_compare_columns:
-            self.key_columns_edit.setText(", ".join(self.current_compare_columns))
+        # Отображаем схему в таблице
+        self._set_schema_to_table(self.current_schema, self.current_compare_columns)
         
         # Устанавливаем точность
         tolerance_value = int(self.current_tolerance * 1000000)
@@ -907,19 +1172,16 @@ class MainWindow(QMainWindow):
     
 
     def _apply_custom_schema(self):
-        """Применение пользовательской схемы из редактора"""
+        """Применение пользовательской схемы из таблицы"""
         try:
-            schema_text = self.schema_editor.toPlainText().strip()
-            if not schema_text:
+            schema = self._get_schema_from_table()
+            
+            if not schema:
                 QMessageBox.warning(self, "Предупреждение", "Схема пуста!")
                 return
             
-            schema = parse_schema_text(schema_text)
-            
-            # Обновляем ключевые столбцы через утилиту
-            self.current_compare_columns = parse_key_columns(self.key_columns_edit.text())
-            
-            # Обновляем точность из интерфейса
+            self.current_schema = schema
+            self.current_compare_columns = self._get_key_columns_from_table()
             self.current_tolerance = self.tolerance_spin.value() / 1_000_000
             
             self.log(f"Применена пользовательская схема ({len(schema)} столбцов, точность: {self.current_tolerance})")
@@ -931,32 +1193,23 @@ class MainWindow(QMainWindow):
     def _save_current_schema(self):
         """Сохранение текущей схемы в файл JSON"""
         try:
-            # Получаем текущую схему из редактора
-            schema_text = self.schema_editor.toPlainText().strip()
-            if not schema_text:
+            schema = self._get_schema_from_table()
+            
+            if not schema:
                 QMessageBox.warning(self, "Предупреждение", "Схема пуста!")
                 return
             
-            # Парсим схему через утилиту
-            schema = parse_schema_text(schema_text)
-            
-            # Получаем ключевые столбцы через утилиту
-            key_columns = parse_key_columns(self.key_columns_edit.text())
-            
-            # Получаем точность из интерфейса
+            key_columns = self._get_key_columns_from_table()
             tolerance = self.tolerance_spin.value() / 1_000_000
             
-            # Текущее имя схемы
             schema_name = self.schema_combo.currentText()
             
             if schema_name:
-                # Обновляем существующую схему
                 self.schema_manager.update_schema(
                     schema_name, schema_name, schema, key_columns, tolerance
                 )
                 self.log(f"Схема обновлена: {schema_name} (точность: {tolerance})")
             else:
-                # Создаем новую схему
                 reply = QMessageBox.question(
                     self, "Новая схема",
                     "Хотите создать новую схему?",
@@ -966,8 +1219,10 @@ class MainWindow(QMainWindow):
                 if reply == QMessageBox.Yes:
                     self._add_schema()
             
-            # Перезагружаем список схем
+            current_schema = self.schema_combo.currentText()
             self._load_schema_list()
+            if current_schema:
+                self.schema_combo.setCurrentText(current_schema)
             
             QMessageBox.information(
                 self, "Успех",
@@ -980,19 +1235,13 @@ class MainWindow(QMainWindow):
 
     def _add_schema(self):
         """Добавление новой схемы"""
-        # Загружаем текущую схему из редактора
-        schema_text = self.schema_editor.toPlainText().strip()
-        key_text = self.key_columns_edit.text().strip()
+        schema = self._get_schema_from_table()
+        key_columns = self._get_key_columns_from_table()
         tolerance = self.tolerance_spin.value() / 1_000_000
         
-        schema = {}
-        if schema_text:
-            try:
-                schema = parse_schema_text(schema_text)
-            except Exception:
-                schema = {}
-        
-        key_columns = parse_key_columns(self.key_columns_edit.text())
+        if not schema:
+            QMessageBox.warning(self, "Предупреждение", "Схема пуста! Добавьте столбцы.")
+            return
         
         schema_data = {
             'schema': schema,
@@ -1028,7 +1277,7 @@ class MainWindow(QMainWindow):
     
 
     def _edit_current_schema(self):
-        """Редактирование текущей схемы"""
+        """Редактирование текущей схемы — загружает в таблицу"""
         schema_name = self.schema_combo.currentText()
         if not schema_name:
             QMessageBox.warning(self, "Предупреждение", "Выберите схему для редактирования!")
@@ -1038,33 +1287,20 @@ class MainWindow(QMainWindow):
         if not schema_data:
             return
         
-        dialog = SchemaEditorDialog(
-            self.schema_manager,
-            schema_name=schema_name,
-            schema_data=schema_data,
-            parent=self
-        )
+        # Загружаем схему в таблицу для редактирования
+        schema = schema_data.get('schema', {})
+        key_columns = schema_data.get('key_columns', [])
+        tolerance = schema_data.get('tolerance', 0.0)
         
-        if dialog.exec() == QDialog.Accepted:
-            result = dialog.result
-            if result:
-                # Обновляем схему (с возможностью переименования)
-                self.schema_manager.update_schema(
-                    schema_name, 
-                    result['name'],
-                    result['schema'],
-                    result['key_columns'],
-                    result.get('tolerance', 0.0)
-                )
-                self._load_schema_list()
-                self.schema_combo.setCurrentText(result['name'])
-                self.apply_schema_template(result['name'])
-                self.log(f"Схема обновлена: {result['name']}")
-                QMessageBox.information(
-                    self, "Успех",
-                    f"Схема '{result['name']}' обновлена в файле:\n"
-                    f"{self.schema_manager.get_schema_file_path()}"
-                )
+        self._set_schema_to_table(schema, key_columns)
+        self.tolerance_spin.setValue(int(tolerance * 1_000_000))
+        
+        self.log(f"Схема '{schema_name}' загружена в таблицу для редактирования")
+        QMessageBox.information(
+            self, "Редактирование",
+            f"Схема '{schema_name}' загружена в таблицу.\n"
+            f"Отредактируйте столбцы и нажмите 'Сохранить схему'."
+        )
   
 
     def _delete_current_schema(self):
@@ -1108,7 +1344,63 @@ class MainWindow(QMainWindow):
                 self.file2_path.setText(file_path)
             
             self.log(f"Выбран файл {file_num}: {file_path}")
+            
+            # Автоопределение разделителя
+            if self.sep_auto_checkbox.isChecked():
+                self._auto_detect_separator(file_path)
+            
             self._update_button_states()
+    
+    def _auto_detect_separator(self, file_path: str) -> str:
+        """
+        Автоопределение разделителя CSV файла.
+        Возвращает обнаруженный разделитель или пустую строку при ошибке.
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                sample = f.read(8192)
+            
+            # Считаем частоту каждого разделителя
+            candidates = {
+                ',': sample.count(','),
+                ';': sample.count(';'),
+                '\t': sample.count('\t'),
+                '|': sample.count('|')
+            }
+            
+            # Выбираем разделитель с максимальной частотой
+            best_sep = max(candidates, key=candidates.get)
+            best_count = candidates[best_sep]
+            
+            # Если лучший разделитель встречается менее 3 раз — считаем что разделитель не определён
+            if best_count < 3:
+                self.sep_auto_label.setText("—")
+                return ""
+            
+            # Отображаем обнаруженный разделитель
+            sep_display = {',': ',', ';': ';', '\t': 'TAB', '|': '|'}
+            self.sep_auto_label.setText(f"{sep_display.get(best_sep, best_sep)}")
+            
+            # Устанавливаем в комбобокс
+            self.sep_combo.setCurrentText(best_sep)
+            
+            return best_sep
+            
+        except Exception as e:
+            self.sep_auto_label.setText("ERR")
+            return ""
+    
+    def _update_separator_display(self):
+        """Обновление отображения разделителя при переключении авто/ручной режим"""
+        if self.sep_auto_checkbox.isChecked():
+            # Если выбран файл — определяем разделитель
+            file_path = self.file1_path.text() or self.file2_path.text()
+            if file_path and os.path.exists(file_path):
+                self._auto_detect_separator(file_path)
+            else:
+                self.sep_auto_label.setText("?")
+        else:
+            self.sep_auto_label.setText("")
     
 
     def _select_output_dir(self):
@@ -1118,7 +1410,7 @@ class MainWindow(QMainWindow):
         )
         
         if dir_path:
-            self.output_dir = Path(dir_path)
+            self.output_dir = Path(dir_path).resolve()
             self.output_path.setText(str(self.output_dir))
             self.log(f"Каталог результатов: {self.output_dir}")
   
@@ -1142,7 +1434,7 @@ class MainWindow(QMainWindow):
         # Обновляем каталог результатов
         output_path = self.output_path.text().strip()
         if output_path:
-            self.output_dir = Path(output_path)
+            self.output_dir = Path(output_path).resolve()
 
         # Если включён чанковый режим – не загружаем данные в память
         if self.chunked_checkbox.isChecked():
@@ -1152,16 +1444,45 @@ class MainWindow(QMainWindow):
             self._update_button_states()
             return
 
-        sep = self.sep_combo.currentText()
+        # Автоопределение разделителя перед загрузкой (если включено)
+        if self.sep_auto_checkbox.isChecked():
+            self.log("Автоопределение разделителя перед загрузкой...")
+            sep = self._auto_detect_separator(path1)
+            if not sep:
+                # Fallback: пробуем определить по второму файлу
+                sep = self._auto_detect_separator(path2)
+            if sep:
+                self.log(f"  Разделитель определён: '{sep}'")
+            else:
+                self.log("  Не удалось определить разделитель, используем ','")
+                sep = ","
+        else:
+            sep = self.sep_combo.currentText()
         # Иначе загружаем как обычно
         try:
             self.log(f"Загрузка файла 1: {path1}")
             self.df1 = read_csv_with_schema_v1(path1, type_mapping=self.current_schema, sep=sep)
             self.log(f"  ✓ Загружено: {len(self.df1)} строк, {len(self.df1.columns)} столбцов")
+            self.log(f"  Столбцы: {', '.join(self.df1.columns[:5])}{'...' if len(self.df1.columns) > 5 else ''}")
+            
+            # Предпросмотр первых 3 строк
+            if len(self.df1) > 0:
+                self.log(f"  Первые строки:")
+                for idx, row in self.df1.head(3).iterrows():
+                    preview = ', '.join(f"{col}={row[col]}" for col in list(self.df1.columns)[:4])
+                    self.log(f"    [{idx}] {preview}{'...' if len(self.df1.columns) > 4 else ''}")
 
             self.log(f"Загрузка файла 2: {path2}")
             self.df2 = read_csv_with_schema_v1(path2, type_mapping=self.current_schema, sep=sep)
             self.log(f"  ✓ Загружено: {len(self.df2)} строк, {len(self.df2.columns)} столбцов")
+            self.log(f"  Столбцы: {', '.join(self.df2.columns[:5])}{'...' if len(self.df2.columns) > 5 else ''}")
+            
+            # Предпросмотр первых 3 строк
+            if len(self.df2) > 0:
+                self.log(f"  Первые строки:")
+                for idx, row in self.df2.head(3).iterrows():
+                    preview = ', '.join(f"{col}={row[col]}" for col in list(self.df2.columns)[:4])
+                    self.log(f"    [{idx}] {preview}{'...' if len(self.df2.columns) > 4 else ''}")
 
             self._update_button_states()
             self.log("Файлы успешно загружены!")
@@ -1211,10 +1532,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Предупреждение", "Сначала загрузите файлы!")
             return
 
-        # Парсим ключевые столбцы
-        key_text = self.key_columns_edit.text().strip()
-        if key_text:
-            self.current_compare_columns = [col.strip() for col in key_text.split(",")]
+        # Парсим ключевые столбцы из таблицы схемы
+        self.current_compare_columns = self._get_key_columns_from_table()
 
         if not self.current_compare_columns:
             QMessageBox.warning(self, "Предупреждение", "Укажите ключевые столбцы!")
@@ -1304,7 +1623,15 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._on_comparison_finished)
         self.worker.error.connect(self._on_comparison_error)
         self.worker.key_uniqueness_warning.connect(self._on_key_uniqueness_warning)
+        self.worker.progress_chunk.connect(self._on_chunk_progress)
         self.worker.start()
+    
+    def _on_chunk_progress(self, current: int, total: int):
+        """Обработка прогресса чанковой загрузки"""
+        if total > 0:
+            percent = int(current / total * 100)
+            self.progress_bar.setValue(percent)
+            self.log(f"  Загрузка: {current}/{total} чанков ({percent}%)")
 
     def _on_key_uniqueness_warning(self, message: str, details: str):
         """Обработка предупреждения о неуникальных ключах"""
@@ -1541,7 +1868,22 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(table)
         
+        # Кнопка "Копировать в буфер"
+        copy_btn = QPushButton("📋 Копировать в буфер")
+        copy_btn.clicked.connect(lambda: self._copy_to_clipboard(df))
+        layout.addWidget(copy_btn)
+        
         return widget
+    
+    def _copy_to_clipboard(self, df: pd.DataFrame):
+        """Копирование DataFrame в буфер обмена в формате TSV"""
+        try:
+            clipboard = QApplication.clipboard()
+            tsv_data = df.to_csv(sep='\t', index=False)
+            clipboard.setText(tsv_data)
+            self.log(f"Скопировано {len(df)} строк в буфер обмена")
+        except Exception as e:
+            self.log(f"Ошибка копирования: {e}", is_error=True)
 
     def _save_results(self):
         """Сохранение результатов в единый Excel-файл с вкладками"""
@@ -1559,7 +1901,7 @@ class MainWindow(QMainWindow):
             save_dir.mkdir(parents=True, exist_ok=True)
             
             # Единый Excel-файл с вкладками
-            excel_path = save_dir / f"report_{timestamp}.xlsx"
+            excel_path = (save_dir / f"report_{timestamp}.xlsx").resolve()
             
             with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
                 sheet_num = 1
@@ -1616,11 +1958,15 @@ class MainWindow(QMainWindow):
                         f.write("\n" + "=" * 80 + "\n\n")
                 self.log(f"Сохранено: {warnings_path}")
             
-            QMessageBox.information(
+            reply = QMessageBox.information(
                 self, "Сохранение",
                 f"Результаты сохранены в:\n{excel_path}\n\n"
-                f"Файл содержит {sheet_num} вкладок с результатами сравнения."
+                f"Файл содержит {sheet_num} вкладок с результатами сравнения.",
+                QMessageBox.Ok | QMessageBox.Open
             )
+            
+            if reply == QMessageBox.Open:
+                os.startfile(str(excel_path.parent))
             
         except Exception as e:
             QMessageBox.critical(self, "Ошибка сохранения", str(e))
@@ -1642,9 +1988,108 @@ class MainWindow(QMainWindow):
         self.log("Все данные очищены")
 
     def _update_button_states(self):
-        """Обновление состояния кнопок"""
-        has_files = bool(self.file1_path.text()) and bool(self.file2_path.text())
+        """Обновление состояния кнопок и цветовой индикации"""
+        path1 = self.file1_path.text().strip()
+        path2 = self.file2_path.text().strip()
+        has_files = bool(path1) and bool(path2) and os.path.exists(path1) and os.path.exists(path2)
         self.btn_compare.setEnabled(has_files)
+        
+        # Цветовая индикация полей файлов
+        self._update_file_field_color(self.file1_path, "Файл 1")
+        self._update_file_field_color(self.file2_path, "Файл 2")
+    
+    def _update_file_field_color(self, field: QLineEdit, field_name: str):
+        """Обновление цвета рамки поля в зависимости от статуса"""
+        text = field.text().strip()
+        if not text:
+            field.setStyleSheet("border: 1px solid #ccc;")
+        elif os.path.exists(text):
+            field.setStyleSheet("border: 2px solid #4CAF50; background-color: #E8F5E9;")
+        else:
+            field.setStyleSheet("border: 2px solid #F44336; background-color: #FFEBEE;")
+    
+    def _load_last_session(self):
+        """Загрузка последней сессии из файла"""
+        try:
+            session_file = Path.home() / ".compare_csv_session.json"
+            if session_file.exists():
+                with open(session_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                file1 = data.get('file1', '')
+                file2 = data.get('file2', '')
+                schema = data.get('schema', '')
+                separator = data.get('separator', ',')
+                sep_auto = data.get('sep_auto', False)
+                chunked = data.get('chunked', False)
+                chunksize = data.get('chunksize', 50000)
+                agg = data.get('agg', False)
+                agg_func = data.get('agg_func', 'sum')
+                tolerance = data.get('tolerance', 0)
+                
+                if file1 and os.path.exists(file1):
+                    self.file1_path.setText(file1)
+                if file2 and os.path.exists(file2):
+                    self.file2_path.setText(file2)
+                if schema:
+                    self.schema_combo.setCurrentText(schema)
+                
+                # Восстанавливаем разделитель
+                if separator in [',', ';', '\t', '|']:
+                    self.sep_combo.setCurrentText(separator)
+                
+                # Восстанавливаем автоопределение разделителя
+                self.sep_auto_checkbox.setChecked(sep_auto)
+                
+                # Восстанавливаем чанковый режим
+                self.chunked_checkbox.setChecked(chunked)
+                self.chunksize_spin.setValue(chunksize)
+                
+                # Восстанавливаем агрегацию
+                self.agg_checkbox.setChecked(agg)
+                if agg_func in ["sum", "mean", "min", "max"]:
+                    self.agg_func_combo.setCurrentText(agg_func)
+                
+                # Восстанавливаем точность
+                self.tolerance_spin.setValue(int(tolerance))
+                
+                self.log("Сессия восстановлена из предыдущего запуска")
+        except Exception as e:
+            self.log(f"Не удалось загрузить сессию: {e}")
+    
+    def _save_last_session(self):
+        """Сохранение текущей сессии в файл"""
+        try:
+            session_file = Path.home() / ".compare_csv_session.json"
+            data = {
+                'file1': self.file1_path.text(),
+                'file2': self.file2_path.text(),
+                'schema': self.schema_combo.currentText(),
+                'separator': self.sep_combo.currentText(),
+                'sep_auto': self.sep_auto_checkbox.isChecked(),
+                'chunked': self.chunked_checkbox.isChecked(),
+                'chunksize': self.chunksize_spin.value(),
+                'agg': self.agg_checkbox.isChecked(),
+                'agg_func': self.agg_func_combo.currentText(),
+                'tolerance': self.tolerance_spin.value()
+            }
+            with open(session_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"Не удалось сохранить сессию: {e}")
+    
+    def closeEvent(self, event):
+        """Обработка закрытия окна"""
+        # Сохраняем сессию
+        self._save_last_session()
+        
+        # Останавливаем worker если он работает
+        if hasattr(self, 'worker') and self.worker is not None:
+            if self.worker.isRunning():
+                self.worker.terminate()
+                self.worker.wait()
+        
+        event.accept()
 
     def log(self, message: str, is_error: bool = False):
         """Добавление сообщения в лог"""

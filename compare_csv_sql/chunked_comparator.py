@@ -63,12 +63,71 @@ class ChunkedComparator:
         ''')
         self.conn.commit()
 
+    def _auto_detect_sep(self, file_path: str) -> str:
+        """Автоопределение разделителя CSV файла"""
+        try:
+            with open(file_path, 'r', encoding=self.encoding) as f:
+                sample = f.read(8192)
+            candidates = {
+                ',': sample.count(','),
+                ';': sample.count(';'),
+                '\t': sample.count('\t'),
+                '|': sample.count('|')
+            }
+            best_sep = max(candidates, key=candidates.get)
+            if candidates[best_sep] >= 3:
+                return best_sep
+        except Exception:
+            pass
+        return ','
+
+    def _validate_columns(self, file_path: str, table_name: str):
+        """Проверка что все столбцы из схемы есть в CSV-файле"""
+        all_cols = list(self.schema.keys())
+        
+        # Автоопределение разделителя перед чтением заголовков
+        detected_sep = self._auto_detect_sep(file_path)
+        
+        # Читаем только заголовки с определённым разделителем
+        try:
+            df_temp = pd.read_csv(file_path, nrows=0, encoding=self.encoding, sep=detected_sep)
+            file_columns = set(df_temp.columns)
+        except Exception as e:
+            raise FileNotFoundError(f"Не удалось прочитать заголовки {file_path}: {e}")
+        
+        missing_cols = [col for col in all_cols if col not in file_columns]
+        if missing_cols:
+            available = ', '.join(list(file_columns)[:10])
+            if len(file_columns) > 10:
+                available += '...'
+            raise ValueError(
+                f"В файле {table_name} ({file_path}) не найдены столбцы схемы:\n"
+                f"  Отсутствуют: {', '.join(missing_cols)}\n"
+                f"  Доступные: {available}\n"
+                f"  Разделитель определён: '{detected_sep}'"
+            )
+        
+        # Если разделитель не совпадает с указанным — обновляем
+        if detected_sep != self.sep:
+            self.sep = detected_sep
+        
+        return True
+
     def _load_file(self, file_path: str, table_name: str):
         """Загрузка CSV файла в SQLite с оптимизациями:
         1. Один astype(str) вместо трёх
         2. Векторизованное хеширование вместо apply(axis=1)
         """
         all_cols = list(self.schema.keys())
+        
+        # Валидация столбцов перед загрузкой
+        try:
+            self._validate_columns(file_path, table_name)
+        except ValueError as e:
+            raise ValueError(str(e))
+        except Exception as e:
+            raise ValueError(f"Ошибка валидации {table_name}: {e}")
+        
         cursor = self.conn.cursor()
         for chunk in pd.read_csv(file_path,
                                  usecols=all_cols,
