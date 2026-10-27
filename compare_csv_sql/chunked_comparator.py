@@ -131,7 +131,8 @@ class ChunkedComparator:
         
         return True
 
-    def _load_file(self, file_path: str, table_name: str):
+    def _load_file(self, file_path: str, table_name: str, file_label: str = "",
+                   file_total_chunks: int = 0, cumulative_offset: int = 0, cumulative_total: int = 0):
         """Загрузка CSV файла в SQLite с оптимизациями:
         1. Один astype(str) вместо трёх
         2. Векторизованное хеширование вместо apply(axis=1)
@@ -153,16 +154,18 @@ class ChunkedComparator:
         current_chunk = 0
         total_chunks = 0
         
+        # Реальное количество чанков — считаем через тот же pd.read_csv
+        total_chunks = self._count_chunks(file_path, all_cols)
+        
         try:
             for chunk in pd.read_csv(file_path,
-                                     usecols=all_cols,
-                                     dtype=self.schema,
-                                     chunksize=self.chunksize,
-                                     low_memory=False,
-                                     encoding=self.encoding,
-                                     sep=self.sep):
+                                      usecols=all_cols,
+                                      dtype=self.schema,
+                                      chunksize=self.chunksize,
+                                      low_memory=False,
+                                      encoding=self.encoding,
+                                      sep=self.sep):
                 current_chunk += 1
-                total_chunks += 1
                 
                 # Оптимизация: один astype(str) вместо трёх
                 # chunk_str = chunk.astype(str).fillna('')
@@ -202,9 +205,12 @@ class ChunkedComparator:
                     if batch_count % commits_per_batch == 0:
                         self.conn.commit()
                 
-                # Эмитим прогресс после каждого чанка (accurate count)
+                # Эмитим прогресс после каждого чанка
                 if self.progress_callback:
-                    self.progress_callback(current_chunk, total_chunks)
+                    global_current = current_chunk + cumulative_offset if cumulative_offset else current_chunk
+                    global_total = cumulative_total if cumulative_total else file_total_chunks
+                    self.progress_callback(current_chunk, file_total_chunks,
+                                          global_current, global_total, file_label)
         
         except ValueError as e:
             if "Usecols do not match columns" in str(e):
@@ -226,8 +232,32 @@ class ChunkedComparator:
         self.conn.commit()
         
         # Гарантируем прогресс для пустого файла (0 чанков)
-        if self.progress_callback and total_chunks == 0:
-            self.progress_callback(0, 1)
+        if self.progress_callback and file_total_chunks == 0:
+            global_current = cumulative_offset if cumulative_offset else 0
+            global_total = cumulative_total if cumulative_total else 1
+            self.progress_callback(0, 1, global_current, global_total, file_label)
+
+    def _count_rows(self, file_path: str) -> int:
+        """Подсчёт количества строк в CSV файле (без чтения данных)"""
+        count = 0
+        with open(file_path, 'r', encoding=self.encoding) as f:
+            # Пропускаем заголовок
+            next(f, None)
+            for _ in f:
+                count += 1
+        return max(1, count)
+
+    def _count_chunks(self, file_path: str, all_cols: list) -> int:
+        """Подсчёт реального количества чанков (итераций pd.read_csv)"""
+        count = 0
+        for _ in pd.read_csv(file_path,
+                              usecols=all_cols,
+                              chunksize=self.chunksize,
+                              low_memory=False,
+                              encoding=self.encoding,
+                              sep=self.sep):
+            count += 1
+        return max(1, count)
 
     def _log(self, message: str):
         """Отправка сообщения в лог"""
@@ -317,8 +347,18 @@ class ChunkedComparator:
         return results, dup_samples
     
     def load_data(self):
-        self._load_file(self.df1_path, 'df1')
-        self._load_file(self.df2_path, 'df2')
+        # Считаем чанки для каждого файла заранее
+        all_cols = list(self.schema.keys())
+        df1_chunks = self._count_chunks(self.df1_path, all_cols)
+        df2_chunks = self._count_chunks(self.df2_path, all_cols)
+        total_all = df1_chunks + df2_chunks
+        
+        self._load_file(self.df1_path, 'df1', file_label='Файл 1',
+                        file_total_chunks=df1_chunks,
+                        cumulative_offset=0, cumulative_total=total_all)
+        self._load_file(self.df2_path, 'df2', file_label='Файл 2',
+                        file_total_chunks=df2_chunks,
+                        cumulative_offset=df1_chunks, cumulative_total=total_all)
         
         # Агрегация если включена
         if self.agg_func:
@@ -346,6 +386,16 @@ class ChunkedComparator:
         self._log(f"Функция агрегации: {agg_func}")
         self._log(f"Ключевые столбцы: {', '.join(self.key_columns)}")
         self._log(f"{'='*60}")
+
+        def _fmt_number(value, col_type):
+            """Возвращает строку в том же формате, что _load_file записал в row_json."""
+            if pd.isna(value):
+                return ''
+            if col_type == 'int':
+                return str(int(round(float(value))))
+            # col_type == 'float'
+            return str(float(value))
+
         
         for table in ['df1', 'df2']:
             # Получаем количество строк до агрегации
@@ -375,37 +425,62 @@ class ChunkedComparator:
             # Создаём DataFrame
             df = pd.DataFrame(parsed_data)
             
-            # Проверяем, какие неключевые столбцы числовые
+            # # Проверяем, какие неключевые столбцы числовые
+            # numeric_cols = []
+            # non_numeric_cols = []
+            
+            # for col in non_key_cols:
+            #     try:
+            #         pd.to_numeric(df[col], errors='coerce')
+            #         # Проверяем, что хотя бы 50% значений числовые
+            #         numeric_count = df[col].apply(lambda x: pd.to_numeric(x, errors='ignore') if isinstance(x, str) else x).apply(
+            #             lambda x: isinstance(x, (int, float))
+            #         ).sum()
+            #         if numeric_count > len(df) * 0.5:
+            #             numeric_cols.append(col)
+            #         else:
+            #             non_numeric_cols.append(col)
+            #     except (ValueError, TypeError):
+            #         non_numeric_cols.append(col)
+
             numeric_cols = []
             non_numeric_cols = []
             
             for col in non_key_cols:
-                try:
-                    pd.to_numeric(df[col], errors='coerce')
-                    # Проверяем, что хотя бы 50% значений числовые
-                    numeric_count = df[col].apply(lambda x: pd.to_numeric(x, errors='ignore') if isinstance(x, str) else x).apply(
-                        lambda x: isinstance(x, (int, float))
-                    ).sum()
-                    if numeric_count > len(df) * 0.5:
-                        numeric_cols.append(col)
-                    else:
-                        non_numeric_cols.append(col)
-                except (ValueError, TypeError):
+                if agg_func == 'first':
                     non_numeric_cols.append(col)
+                    continue
+                
+                col_type = self.schema.get(col)
+                if col_type in ('float', 'int'):
+                    converted = pd.to_numeric(df[col], errors='coerce')
+                    if converted.notna().any():
+                        df[col] = converted.astype('float64')
+                        numeric_cols.append(col)
+                        continue
+                    self._log(
+                        f"  ⚠️ {table}: колонка '{col}' помечена как {col_type}, "
+                        f"но не содержит числовых значений — будет 'first'"
+                    )
+                non_numeric_cols.append(col)
             
             if numeric_cols:
                 self._log(f"  Числовые столбцы (агрегируются): {', '.join(numeric_cols)}")
             if non_numeric_cols:
                 self._log(f"  Строковые столбцы (первое значение): {', '.join(non_numeric_cols)}")
             
-            # Строим словарь агрегации
-            agg_dict = {}
-            for col in numeric_cols:
-                if agg_func == 'first':
-                    agg_dict[col] = 'first'
-                else:
-                    agg_dict[col] = agg_func
+            # # Строим словарь агрегации
+            # agg_dict = {}
+            # for col in numeric_cols:
+            #     if agg_func == 'first':
+            #         agg_dict[col] = 'first'
+            #     else:
+            #         agg_dict[col] = agg_func
             
+            # for col in non_numeric_cols:
+            #     agg_dict[col] = 'first'
+
+            agg_dict = {col: agg_func for col in numeric_cols}
             for col in non_numeric_cols:
                 agg_dict[col] = 'first'
             
@@ -433,8 +508,14 @@ class ChunkedComparator:
             data_to_insert = []
             for _, row in df_agg.iterrows():
                 key_values = [str(row[col]) for col in self.key_columns]
-                row_values = [str(row[col]) for col in all_cols]
+                # row_values = [str(row[col]) for col in all_cols]
                 
+                row_values = [
+                    _fmt_number(row[col], self.schema.get(col))
+                    if col in numeric_cols else str(row[col])
+                    for col in all_cols
+                ]
+
                 key_hash_input = SEP.join(key_values)
                 key_hash = hashlib.md5(key_hash_input.encode('utf-8')).hexdigest()
                 key_json = SEP.join(key_values)
@@ -616,6 +697,10 @@ class ChunkedComparator:
         # Показываем info про усечение по LIMIT.
         if self.df1_df2_value is not None and not self.df1_df2_value.empty:
             self._truncated_df1_df2_value = total_diff > self.max_display_rows
+
+        self._total_only1 = total_only1
+        self._total_only2 = total_only2
+        self._total_diff = total_diff    
 
     def _sort_columns_with_suffixes(self, df: pd.DataFrame, schema: List[str] = None) -> pd.DataFrame:
         """Передаёт работу общей утилите из utils.py"""

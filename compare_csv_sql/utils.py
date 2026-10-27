@@ -27,13 +27,25 @@ def sort_columns_with_suffixes(df, key_columns: List[str], schema: Dict[str, str
     
     # Определяем порядок non-key столбцов
     if schema:
-        # Порядок из схемы (сохраняет пользовательский порядок)
-        schema_cols = [col for col in schema.keys() if col not in key_cols]
-        # Сохраняем только те, что есть в other_cols (на случай расхождений)
-        schema_order = [col for col in schema_cols if col in other_cols]
-        # Добавляем остальные, которых нет в схеме (на всякий случай)
-        remaining = [col for col in other_cols if col not in schema_order]
-        ordered_bases = schema_order + remaining
+        # # Порядок из схемы (сохраняет пользовательский порядок)
+        # schema_cols = [col for col in schema.keys() if col not in key_cols]
+        # # Сохраняем только те, что есть в other_cols (на случай расхождений)
+        # schema_order = [col for col in schema_cols if col in other_cols]
+        # # Добавляем остальные, которых нет в схеме (на всякий случай)
+        # remaining = [col for col in other_cols if col not in schema_order]
+        # ordered_bases = schema_order + remaining
+    # Идём по схеме и для каждого базового имени берём существующие суффиксы
+        ordered_bases = []
+        for base in schema.keys():
+            if base in key_cols:
+                continue
+            for suffixed in (f"{base}_df1", f"{base}_df2", base):
+                if suffixed in other_cols:
+                    ordered_bases.append(suffixed)
+        # добавляем всё, что не покрыто схемой
+        for col in other_cols:
+            if col not in ordered_bases:
+                ordered_bases.append(col)        
     else:
         # Fallback: порядок из DataFrame
         ordered_bases = other_cols

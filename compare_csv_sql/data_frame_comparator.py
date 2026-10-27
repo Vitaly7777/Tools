@@ -149,37 +149,73 @@ class InMemoryComparator:
                 self._log(f"  {df_name}: таблица пуста, пропуск")
                 continue
             
-            # Проверяем, какие неключевые столбцы числовые
+            # # Проверяем, какие неключевые столбцы числовые
+            # numeric_cols = []
+            # non_numeric_cols = []
+            
+            # for col in non_key_cols:
+            #     try:
+            #         pd.to_numeric(df[col], errors='coerce')
+            #         # Проверяем, что хотя бы 50% значений числовые
+            #         numeric_count = df[col].apply(lambda x: pd.to_numeric(x, errors='ignore') if isinstance(x, str) else x).apply(
+            #             lambda x: isinstance(x, (int, float))
+            #         ).sum()
+            #         if numeric_count > rows_before * 0.5:
+            #             numeric_cols.append(col)
+            #         else:
+            #             non_numeric_cols.append(col)
+            #     except (ValueError, TypeError):
+            #         non_numeric_cols.append(col)
+
+            # Определяем числовые колонки ПО СХЕМЕ, а не по значениям.
+            # Причины: (1) детерминизм, (2) согласованность с read_csv_with_schema_v1,
+            # (3) одинаковое поведение для df1 и df2.
+            #
+            # Для agg_func='first' числовая агрегация не нужна — все колонки идут 'first',
+            # причём 'first' должен вернуть ОРИГИНАЛЬНОЕ (строковое) значение,
+            # а не результат пересчёта через float — поэтому конверсию пропускаем.
             numeric_cols = []
             non_numeric_cols = []
             
             for col in non_key_cols:
-                try:
-                    pd.to_numeric(df[col], errors='coerce')
-                    # Проверяем, что хотя бы 50% значений числовые
-                    numeric_count = df[col].apply(lambda x: pd.to_numeric(x, errors='ignore') if isinstance(x, str) else x).apply(
-                        lambda x: isinstance(x, (int, float))
-                    ).sum()
-                    if numeric_count > rows_before * 0.5:
-                        numeric_cols.append(col)
-                    else:
-                        non_numeric_cols.append(col)
-                except (ValueError, TypeError):
+                if agg_func == 'first':
                     non_numeric_cols.append(col)
+                    continue
+                
+                col_type = self.schema.get(col)
+                if col_type in ('float', 'int'):
+                    converted = pd.to_numeric(df[col], errors='coerce')
+                    if converted.notna().any():
+                        # .astype('float64') гарантирует одинаковый dtype
+                        # в df1 и df2 — иначе merge/is_numeric_dtype могут
+                        # разойтись (например, Int64 vs float64).
+                        df[col] = converted.astype('float64')
+                        numeric_cols.append(col)
+                        continue
+                    self._log(
+                        f"  ⚠️ {df_name}: колонка '{col}' помечена как {col_type}, "
+                        f"но не содержит числовых значений — будет 'first'"
+                    )
+                non_numeric_cols.append(col)
             
             if numeric_cols:
                 self._log(f"  Числовые столбцы (агрегируются): {', '.join(numeric_cols)}")
             if non_numeric_cols:
                 self._log(f"  Строковые столбцы (первое значение): {', '.join(non_numeric_cols)}")
             
-            # Строим словарь агрегации
-            agg_dict = {}
-            for col in numeric_cols:
-                if agg_func == 'first':
-                    agg_dict[col] = 'first'
-                else:
-                    agg_dict[col] = agg_func
+            # # Строим словарь агрегации
+            # agg_dict = {}
+            # for col in numeric_cols:
+            #     if agg_func == 'first':
+            #         agg_dict[col] = 'first'
+            #     else:
+            #         agg_dict[col] = agg_func
             
+            # for col in non_numeric_cols:
+            #     agg_dict[col] = 'first'
+
+            # Строим словарь агрегации: числовые — по agg_func, остальные — 'first'
+            agg_dict = {col: agg_func for col in numeric_cols}
             for col in non_numeric_cols:
                 agg_dict[col] = 'first'
             

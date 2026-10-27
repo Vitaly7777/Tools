@@ -558,10 +558,11 @@ class SchemaEditorDialog(QDialog):
 class CompareWorker(QThread):
     """Поток для выполнения сравнения без блокировки UI"""
     progress = Signal(str)
+    log_message = Signal(str, bool)
     finished = Signal(object)
     error = Signal(str)
     key_uniqueness_warning = Signal(str, str)
-    progress_chunk = Signal(int, int)  # current, total — для чанковой загрузки
+    progress_chunk = Signal(int, int, int, int, str)  # file_current, file_total, global_current, global_total, file_label
     duplicates_found = Signal(str, pd.DataFrame)  # table_name, sample_df
     
     def __init__(self, df1, df2, schema, compare_columns, tolerance,
@@ -625,7 +626,9 @@ class CompareWorker(QThread):
                 encoding=self.encoding,
                 separator=csv_separator,
                 agg_func=self.agg_func,
-                log_callback=self.log_callback
+                log_callback=lambda m, is_error=False: self.log_message.emit(m, is_error),
+                progress_callback=lambda fc, ft, gc, gt, fl: self.progress_chunk.emit(fc, ft, gc, gt, fl),
+                # log_callback=self.log_callback
             )
 
             if self.use_chunked:
@@ -1795,7 +1798,9 @@ class MainWindow(QMainWindow):
         if not os.path.exists(path2):
             QMessageBox.critical(self, "Ошибка", f"Файл не найден: {path2}")
             return
-
+        if not self.current_schema:
+            self.apply_schema_template(self.schema_combo.currentText())
+            
         # Обновляем каталог результатов
         output_path = self.output_path.text().strip()
         if output_path:
@@ -2006,6 +2011,7 @@ class MainWindow(QMainWindow):
             log_callback=self.log  # передаём метод log для вывода в UI
         )
         self.worker.progress.connect(self.log)
+        self.worker.log_message.connect(self.log)
         self.worker.finished.connect(self._on_comparison_finished)
         self.worker.error.connect(self._on_comparison_error)
         self.worker.key_uniqueness_warning.connect(self._on_key_uniqueness_warning)
@@ -2013,12 +2019,15 @@ class MainWindow(QMainWindow):
         self.worker.duplicates_found.connect(self._on_duplicates_found)
         self.worker.start()
     
-    def _on_chunk_progress(self, current: int, total: int):
+    def _on_chunk_progress(self, file_current: int, file_total: int,
+                           global_current: int, global_total: int, file_label: str):
         """Обработка прогресса чанковой загрузки"""
-        if total > 0:
-            percent = int(current / total * 100)
-            self.progress_bar.setValue(percent)
-            self.log(f"  Загрузка: {current}/{total} чанков ({percent}%)")
+        if file_total > 0:
+            file_percent = int(file_current / file_total * 100)
+            self.log(f"  {file_label}: {file_current}/{file_total} чанков ({file_percent}%)")
+        if global_total > 0:
+            global_percent = int(global_current / global_total * 100)
+            self.progress_bar.setValue(global_percent)
 
     def _on_key_uniqueness_warning(self, message: str, details: str):
         """Обработка предупреждения о неуникальных ключах (неблокирующая)"""
@@ -2107,7 +2116,10 @@ class MainWindow(QMainWindow):
         if not self.comparator.df1_only.empty:
             is_chunked = hasattr(self.comparator, '_truncated_df1_only')
             if is_chunked and self.comparator._truncated_df1_only:
-                info_text = f"Показаны первые {len(self.comparator.df1_only)} строк (усечено из M, чанковый режим)"
+                # info_text = f"Показаны первые {len(self.comparator.df1_only)} строк (усечено из M, чанковый режим)"
+                # info_text = f"Показаны первые {len(self.comparator.df1_only)} строк (усечено из M, чанковый режим)"
+                total = getattr(self.comparator, '_total_only1', '?')
+                info_text = f"Показаны первые {len(self.comparator.df1_only)} из {total} строк (чанковый режим)"                
             else:
                 info_text = None
             tab1 = self._create_table_widget(self.comparator.df1_only, self.max_display_rows, info_text)
@@ -2124,7 +2136,9 @@ class MainWindow(QMainWindow):
         if not self.comparator.df2_only.empty:
             is_chunked = hasattr(self.comparator, '_truncated_df2_only')
             if is_chunked and self.comparator._truncated_df2_only:
-                info_text = f"Показаны первые {len(self.comparator.df2_only)} строк (усечено из M, чанковый режим)"
+                # info_text = f"Показаны первые {len(self.comparator.df2_only)} строк (усечено из M, чанковый режим)"
+                total = getattr(self.comparator, '_total_only2', '?')
+                info_text = f"Показаны первые {len(self.comparator.df2_only)} из {total} строк (чанковый режим)"                   
             else:
                 info_text = None
             tab2 = self._create_table_widget(self.comparator.df2_only, self.max_display_rows, info_text)
@@ -2141,7 +2155,9 @@ class MainWindow(QMainWindow):
         if self.comparator.df1_df2_value is not None and not self.comparator.df1_df2_value.empty:
             is_chunked = hasattr(self.comparator, '_truncated_df1_df2_value')
             if is_chunked and self.comparator._truncated_df1_df2_value:
-                info_text = f"Показаны первые {len(self.comparator.df1_df2_value)} строк (усечено из M, чанковый режим)"
+                # info_text = f"Показаны первые {len(self.comparator.df1_df2_value)} строк (усечено из M, чанковый режим)"
+                total = getattr(self.comparator, '_total_diff', '?')
+                info_text = f"Показаны первые {len(self.comparator.df1_df2_value)} из {total} строк (чанковый режим)"   
             else:
                 info_text = None
             tab3 = self._create_table_widget(self.comparator.df1_df2_value, self.max_display_rows, info_text)
