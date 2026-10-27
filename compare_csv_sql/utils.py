@@ -7,13 +7,17 @@
 from typing import Dict, List
 
 
-def sort_columns_with_suffixes(df, key_columns: List[str]):
+def sort_columns_with_suffixes(df, key_columns: List[str], schema: Dict[str, str] = None):
     """
     Сортирует столбцы DataFrame: ключевые первыми, остальные попарно (_df1, _df2).
+    
+    Порядок non-key столбцов определяется схемой (schema), если она передана.
+    Иначе используется порядок из DataFrame.
     
     Args:
         df: DataFrame для сортировки
         key_columns: Список ключевых столбцов
+        schema: Словарь схемы {column_name: column_type} (опционально)
     
     Returns:
         DataFrame с отсортированными столбцами
@@ -21,23 +25,45 @@ def sort_columns_with_suffixes(df, key_columns: List[str]):
     key_cols = [col for col in key_columns if col in df.columns]
     other_cols = [col for col in df.columns if col not in key_cols]
     
-    base_names = set()
-    for col in other_cols:
-        if col.endswith("_df1"):
-            base_names.add(col[:-4])
-        elif col.endswith("_df2"):
-            base_names.add(col[:-4])
-        else:
-            base_names.add(col)
+    # Определяем порядок non-key столбцов
+    if schema:
+        # Порядок из схемы (сохраняет пользовательский порядок)
+        schema_cols = [col for col in schema.keys() if col not in key_cols]
+        # Сохраняем только те, что есть в other_cols (на случай расхождений)
+        schema_order = [col for col in schema_cols if col in other_cols]
+        # Добавляем остальные, которых нет в схеме (на всякий случай)
+        remaining = [col for col in other_cols if col not in schema_order]
+        ordered_bases = schema_order + remaining
+    else:
+        # Fallback: порядок из DataFrame
+        ordered_bases = other_cols
     
+    # Группируем base_name -> (_df1, _df2)
+    base_to_suffixes = {}
+    for col in ordered_bases:
+        if col.endswith("_df1"):
+            base = col[:-4]
+            base_to_suffixes.setdefault(base, []).append("_df1")
+        elif col.endswith("_df2"):
+            base = col[:-4]
+            base_to_suffixes.setdefault(base, []).append("_df2")
+        else:
+            # Столбец без суффикса — добавляем как есть
+            base_to_suffixes.setdefault(col, []).append(None)
+    
+    # Собираем итоговый список столбцов
     sorted_other_cols = []
-    for base_name in sorted(base_names):
-        df1_col = f"{base_name}_df1"
-        df2_col = f"{base_name}_df2"
-        if df1_col in other_cols:
-            sorted_other_cols.append(df1_col)
-        if df2_col in other_cols:
-            sorted_other_cols.append(df2_col)
+    for base in base_to_suffixes:
+        suffixes = base_to_suffixes[base]
+        if None in suffixes:
+            # Столбец без суффикса
+            sorted_other_cols.append(base)
+        else:
+            # Парные столбцы _df1, _df2
+            if "_df1" in suffixes:
+                sorted_other_cols.append(f"{base}_df1")
+            if "_df2" in suffixes:
+                sorted_other_cols.append(f"{base}_df2")
     
     return df[key_cols + sorted_other_cols]
 
@@ -93,3 +119,4 @@ def parse_key_columns(text: str) -> List[str]:
     if not text or not text.strip():
         return []
     return [col.strip() for col in text.split(",")]
+

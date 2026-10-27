@@ -27,7 +27,8 @@ class ChunkedComparator:
                  sep: str = ',',
                  max_display_rows: int = 10000,
                  agg_func: str = None,
-                 log_callback=None):
+                 log_callback=None,
+                 progress_callback=None):
         self.df1_path = df1_path
         self.df2_path = df2_path
         self.key_columns = key_columns
@@ -41,6 +42,7 @@ class ChunkedComparator:
         self.max_display_rows = max_display_rows
         self.agg_func = agg_func  # функция агрегации ('sum', 'mean', 'min', 'max') или None
         self.log_callback = log_callback  # callback для логирования
+        self.progress_callback = progress_callback  # callback для прогресса загрузки (current_chunk, total_chunks)
         self.conn = None
         self.df1_only = pd.DataFrame()
         self.df2_only = pd.DataFrame()
@@ -133,6 +135,7 @@ class ChunkedComparator:
         """Загрузка CSV файла в SQLite с оптимизациями:
         1. Один astype(str) вместо трёх
         2. Векторизованное хеширование вместо apply(axis=1)
+        3. Прогресс-бар через progress_callback
         """
         all_cols = list(self.schema.keys())
         
@@ -147,54 +150,84 @@ class ChunkedComparator:
         cursor = self.conn.cursor()
         batch_count = 0
         commits_per_batch = 100  # commit() раз на 100 батчей (~50 000 строк)
+        current_chunk = 0
+        total_chunks = 0
         
-        for chunk in pd.read_csv(file_path,
-                                 usecols=all_cols,
-                                 dtype=self.schema,
-                                 chunksize=self.chunksize,
-                                 low_memory=False,
-                                 encoding=self.encoding,
-                                 sep=self.sep):
-            # Оптимизация: один astype(str) вместо трёх
-            # chunk_str = chunk.astype(str).fillna('')
-            # ВАЖНО: fillna ДО astype — иначе NaN превращается в строку 'nan'
-            # и fillna('') уже ничего не делает.
-            chunk_str = chunk.fillna('').astype(str)            
+        try:
+            for chunk in pd.read_csv(file_path,
+                                     usecols=all_cols,
+                                     dtype=self.schema,
+                                     chunksize=self.chunksize,
+                                     low_memory=False,
+                                     encoding=self.encoding,
+                                     sep=self.sep):
+                current_chunk += 1
+                total_chunks += 1
+                
+                # Оптимизация: один astype(str) вместо трёх
+                # chunk_str = chunk.astype(str).fillna('')
+                # ВАЖНО: fillna ДО astype — иначе NaN превращается в строку 'nan'
+                # и fillna('') уже ничего не делает.
+                chunk_str = chunk.fillna('').astype(str)            
 
-            # Оптимизация: векторизованное хеширование
-            # key_strs = chunk_str[self.key_columns].copy()
-            # # Заменяем SEP внутри значений, чтобы не ломать парсинг
-            # key_strs = key_strs.replace(SEP, ' ', regex=True)
-            # key_hash_input = key_strs.agg(SEP.join, axis=1)
-            # Экранируем SEP во ВСЕХ строках один раз, а не только в ключах:
-            # иначе row_json/key_json содержат "сырой" \x01 и обратный
-            # split(SEP) в compare() даст некорректные столбцы.
-            chunk_str = chunk_str.replace(SEP, ' ', regex=True)
+                # Оптимизация: векторизованное хеширование
+                # key_strs = chunk_str[self.key_columns].copy()
+                # # Заменяем SEP внутри значений, чтобы не ломать парсинг
+                # key_strs = key_strs.replace(SEP, ' ', regex=True)
+                # key_hash_input = key_strs.agg(SEP.join, axis=1)
+                # Экранируем SEP во ВСЕХ строках один раз, а не только в ключах:
+                # иначе row_json/key_json содержат "сырой" \x01 и обратный
+                # split(SEP) в compare() даст некорректные столбцы.
+                chunk_str = chunk_str.replace(SEP, ' ', regex=True)
 
-            key_strs = chunk_str[self.key_columns]
-            key_hash_input = key_strs.agg(SEP.join, axis=1)
+                key_strs = chunk_str[self.key_columns]
+                key_hash_input = key_strs.agg(SEP.join, axis=1)
 
-            chunk['key_hash'] = key_hash_input.apply(
-                lambda s: hashlib.md5(s.encode('utf-8')).hexdigest()
-            )
-
-            chunk['key_json'] = chunk_str[self.key_columns].agg(SEP.join, axis=1)
-            chunk['row_json'] = chunk_str[all_cols].agg(SEP.join, axis=1)
-            data = chunk[['key_hash', 'key_json', 'row_json']].values.tolist()
-            
-            for i in range(0, len(data), self.insert_batch_size):
-                batch = data[i:i + self.insert_batch_size]
-                cursor.executemany(
-                    f"INSERT INTO {table_name} (key_hash, key_json, row_json) VALUES (?, ?, ?)",
-                    batch
+                chunk['key_hash'] = key_hash_input.apply(
+                    lambda s: hashlib.md5(s.encode('utf-8')).hexdigest()
                 )
-                batch_count += 1
-                # Commit раз на N батчей вместо каждого батча
-                if batch_count % commits_per_batch == 0:
-                    self.conn.commit()
+
+                chunk['key_json'] = chunk_str[self.key_columns].agg(SEP.join, axis=1)
+                chunk['row_json'] = chunk_str[all_cols].agg(SEP.join, axis=1)
+                data = chunk[['key_hash', 'key_json', 'row_json']].values.tolist()
+                
+                for i in range(0, len(data), self.insert_batch_size):
+                    batch = data[i:i + self.insert_batch_size]
+                    cursor.executemany(
+                        f"INSERT INTO {table_name} (key_hash, key_json, row_json) VALUES (?, ?, ?)",
+                        batch
+                    )
+                    batch_count += 1
+                    # Commit раз на N батчей вместо каждого батча
+                    if batch_count % commits_per_batch == 0:
+                        self.conn.commit()
+                
+                # Эмитим прогресс после каждого чанка (accurate count)
+                if self.progress_callback:
+                    self.progress_callback(current_chunk, total_chunks)
+        
+        except ValueError as e:
+            if "Usecols do not match columns" in str(e):
+                # Показываем какие столбцы есть в файле
+                try:
+                    actual_cols = pd.read_csv(file_path, nrows=0, encoding=self.encoding, sep=self.sep).columns.tolist()
+                except Exception:
+                    actual_cols = ["не удалось прочитать"]
+                raise ValueError(
+                    f"Столбцы схемы не совпадают со столбцами файла {file_path}:\n"
+                    f"  Ожидаются: {', '.join(all_cols)}\n"
+                    f"  В файле:   {', '.join(actual_cols)}\n"
+                    f"  Разделитель: '{self.sep}'\n\n"
+                    f"Проверьте, что выбрана правильная схема для этого файла."
+                ) from e
+            raise
         
         # Финальный commit
         self.conn.commit()
+        
+        # Гарантируем прогресс для пустого файла (0 чанков)
+        if self.progress_callback and total_chunks == 0:
+            self.progress_callback(0, 1)
 
     def _log(self, message: str):
         """Отправка сообщения в лог"""
@@ -322,7 +355,8 @@ class ChunkedComparator:
             self._log(f"\nОбработка {table}: {rows_before} строк до агрегации")
             
             # Читаем все данные из таблицы
-            cursor.execute(f'SELECT key_json, row_json FROM {table} ORDER BY row_id')
+            # cursor.execute(f'SELECT key_json, row_json FROM {table} ORDER BY row_id')
+            cursor.execute(f'SELECT key_json, row_json FROM {table}')
             rows = cursor.fetchall()
             
             if not rows:
@@ -565,7 +599,9 @@ class ChunkedComparator:
                 for col in non_key_cols:
                     result_data[f"{col}_df1"] = row1_split[col].values
                     result_data[f"{col}_df2"] = row2_split[col].values
-                self.df1_df2_value = self._sort_columns_with_suffixes(pd.DataFrame(result_data))
+                self.df1_df2_value = self._sort_columns_with_suffixes(
+                    pd.DataFrame(result_data), self.schema
+                )
             else:
                 cols = self.key_columns + [f"{col}_df1" for col in non_key_cols] + \
                        [f"{col}_df2" for col in non_key_cols]
@@ -581,10 +617,10 @@ class ChunkedComparator:
         if self.df1_df2_value is not None and not self.df1_df2_value.empty:
             self._truncated_df1_df2_value = total_diff > self.max_display_rows
 
-    def _sort_columns_with_suffixes(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _sort_columns_with_suffixes(self, df: pd.DataFrame, schema: List[str] = None) -> pd.DataFrame:
         """Передаёт работу общей утилите из utils.py"""
         if sort_columns_with_suffixes:
-            return sort_columns_with_suffixes(df, self.key_columns)
+            return sort_columns_with_suffixes(df, self.key_columns, schema or self.schema)
         # Fallback: оригинальная реализация
         key_cols = [col for col in self.key_columns if col in df.columns]
         other_cols = [col for col in df.columns if col not in key_cols]
@@ -631,3 +667,4 @@ class ChunkedComparator:
     def get_saved_files(self) -> List[str]:
         """Возвращает пути к сохранённым полным результатам."""
         return self._saved_files
+

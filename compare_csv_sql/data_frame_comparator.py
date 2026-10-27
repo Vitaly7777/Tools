@@ -340,12 +340,14 @@ class InMemoryComparator:
         for col in non_key_columns:
             result_data[f"{col}_df1"] = diff_df[f"{col}_df1"].values
             result_data[f"{col}_df2"] = diff_df[f"{col}_df2"].values
-        self.df1_df2_value = self._sort_columns_with_suffixes(pd.DataFrame(result_data))        
+        self.df1_df2_value = self._sort_columns_with_suffixes(
+            pd.DataFrame(result_data), self.schema
+        )
 
-    def _sort_columns_with_suffixes(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _sort_columns_with_suffixes(self, df: pd.DataFrame, schema: List[str] = None) -> pd.DataFrame:
         """Передаёт работу общей утилите из utils.py"""
         if sort_columns_with_suffixes:
-            return sort_columns_with_suffixes(df, self.key_columns)
+            return sort_columns_with_suffixes(df, self.key_columns, schema or self.schema)
         # Fallback: оригинальная реализация
         key_cols = [col for col in self.key_columns if col in df.columns]
         other_cols = [col for col in df.columns if col not in key_cols]
@@ -389,7 +391,7 @@ class InMemoryComparator:
 def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
                       use_chunked=False, df1_path=None, df2_path=None,
                       chunksize=50000, db_path=None, encoding='utf-8', separator=',',
-                      agg_func=None, log_callback=None):
+                      agg_func=None, log_callback=None, progress_callback=None):
     """
     Возвращает подходящий компаратор в зависимости от режима.
 
@@ -436,7 +438,8 @@ def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
             encoding=encoding,
             sep=separator,
             agg_func=agg_func,
-            log_callback=log_callback
+            log_callback=log_callback,
+            progress_callback=progress_callback
         )
     if df1 is None or df2 is None:
         raise ValueError(
@@ -444,3 +447,4 @@ def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
         )
     return InMemoryComparator(df1, df2, tolerance, schema, key_columns,
                               agg_func=agg_func, log_callback=log_callback)   
+

@@ -1,8 +1,9 @@
 import sys
 import os
 import json
-import hashlib
+# import hashlib
 import sqlite3
+import subprocess 
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime
@@ -13,10 +14,9 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QLabel, QTextEdit, QSpinBox,
     QGroupBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QProgressBar, QLineEdit, QComboBox,
-    QCheckBox, QScrollArea, QFormLayout, QListWidget, QListWidgetItem,
-    QDialog, QDialogButtonBox, QMenu, QMenuBar, QToolBar
+    QCheckBox, QDialog, QDialogButtonBox, QTextBrowser
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QTextCursor, QIcon, QAction, QColor
 
 from read_csv_with_schema import read_csv_with_schema_v1
@@ -526,6 +526,7 @@ class SchemaEditorDialog(QDialog):
             key_columns = self._get_key_columns_from_table()
             
             # Получаем точность
+            # tolerance = self.current_tolerance
             tolerance = self.tolerance_spin.value() / 1_000_000
             
             # Проверяем, что все ключевые столбцы есть в схеме
@@ -669,6 +670,59 @@ class CompareWorker(QThread):
 # ============================================================
 # ГЛАВНОЕ ОКНО
 # ============================================================
+class HelpDialog(QDialog):
+    """Диалоговое окно справки (README)"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Справка")
+        self.resize(800, 600)
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowCloseButtonHint
+            | Qt.WindowMaximizeButtonHint
+        )
+
+        layout = QVBoxLayout(self)
+
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        self.browser.setFont(QFont("Segoe UI", 10))
+        self.browser.document().setDefaultStyleSheet("""
+            h1 { font-size: 22px; color: #1f4e79; margin-top: 12px; }
+            h2 { font-size: 18px; color: #2e75b6; margin-top: 10px; }
+            h3 { font-size: 15px; color: #2e75b6; }
+            p  { line-height: 1.4; }
+            code { background-color: #f3f3f3; font-family: Consolas, monospace; }
+            pre  { background-color: #f3f3f3; padding: 8px; }
+            a { color: #0563c1; }
+        """)
+        layout.addWidget(self.browser)
+
+        close_btn = QPushButton("Закрыть")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignRight)
+
+        self._load_readme()
+
+    def _load_readme(self):
+        readme_path = Path(__file__).parent / "README.md"
+        if not readme_path.exists():
+            self.browser.setPlainText(
+                f"Файл справки не найден:\n{readme_path}"
+            )
+            return
+        try:
+            text = readme_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = readme_path.read_text(encoding="cp1251")
+        except Exception as exc:
+            self.browser.setPlainText(f"Не удалось прочитать справку:\n{exc}")
+            return
+        self.browser.setMarkdown(text)
+        self.browser.setWindowFilePath(str(readme_path))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -677,7 +731,6 @@ class MainWindow(QMainWindow):
         self.df2 = None
         self.current_schema = {}
         self.current_compare_columns = []
-        self.current_tolerance = 0.0
         self.output_dir = Path("./tmp/Results/compare_csv").resolve()
         self.schema_manager = SchemaManager()
         self.key_uniqueness_warnings = []
@@ -687,8 +740,9 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self._load_schema_list()
         self._load_last_session()
-
-        if self.schema_combo.count() > 0:
+        
+        # Если таблица схемы пуста (нет сессии), применяем первую схему
+        if self.schema_combo.currentIndex() == 0 and self.schema_table.rowCount() == 0:
             self.apply_schema_template(self.schema_combo.currentText())
 
     def init_ui(self):
@@ -809,12 +863,21 @@ class MainWindow(QMainWindow):
         reload_schemas_action = QAction("Перезагрузить схемы из файла", self)
         reload_schemas_action.triggered.connect(self._reload_schemas)
         schemas_menu.addAction(reload_schemas_action)
+        
+        # Меню Справка
+        help_menu = menubar.addMenu("Справка")
+        
+        open_readme_action = QAction("Открыть справку (README)", self)
+        open_readme_action.setShortcut("F1")
+        open_readme_action.triggered.connect(self._open_readme_in_vscode)
+        help_menu.addAction(open_readme_action)
+
 
     def _create_file_panel(self) -> QGroupBox:
         """Создание панели выбора файлов"""
         group = QGroupBox("Выбор файлов для сравнения")
         layout = QVBoxLayout(group)
-        
+
         # Файл 1 (эталон)
         file1_layout = QHBoxLayout()
         file1_layout.addWidget(QLabel("Файл 1 (эталон):"))
@@ -874,7 +937,25 @@ class MainWindow(QMainWindow):
     def _create_settings_panel(self) -> QGroupBox:
         """Создание панели настроек с добавлением чанкового режима"""
         group = QGroupBox("Настройки сравнения")
-        layout = QHBoxLayout(group)
+        layout = QVBoxLayout(group)
+
+        # Верхняя панель: файл схем и справка
+        info_bar = QHBoxLayout()
+        self.schema_file_label = QLabel(f"Файл схем: {self.schema_manager.get_schema_file_path()}")
+        self.schema_file_label.setStyleSheet("color: #555; font-size: 10px;")
+        self.schema_file_label.setWordWrap(False)
+        info_bar.addWidget(self.schema_file_label)
+        info_bar.addStretch()
+        
+        btn_open_schema = QPushButton("📂 Открыть")
+        btn_open_schema.setMaximumWidth(80)
+        btn_open_schema.clicked.connect(self._open_schemas_file)
+        info_bar.addWidget(btn_open_schema)
+        
+        layout.addLayout(info_bar)
+
+        # Основная область: две колонки
+        content_layout = QHBoxLayout()
 
         # Левая колонка: схема
         schema_layout = QVBoxLayout()
@@ -955,12 +1036,10 @@ class MainWindow(QMainWindow):
 
         schema_layout.addLayout(schema_buttons)
 
-        # Информация о файле схем
-        schema_file_label = QLabel(f"Файл схем: {self.schema_manager.get_schema_file_path()}")
-        schema_file_label.setStyleSheet("color: gray; font-size: 10px;")
-        schema_layout.addWidget(schema_file_label)
-
-        layout.addLayout(schema_layout)
+        # Обёртка QVBoxLayout в QWidget для QHBoxLayout
+        schema_widget = QWidget()
+        schema_widget.setLayout(schema_layout)
+        content_layout.addWidget(schema_widget)
 
         # Правая колонка: параметры сравнения
         params_layout = QVBoxLayout()
@@ -1044,9 +1123,19 @@ class MainWindow(QMainWindow):
 
         params_layout.addLayout(control_buttons)
 
-        layout.addLayout(params_layout)
+        # Обёртка QVBoxLayout в QWidget для QHBoxLayout
+        params_widget = QWidget()
+        params_widget.setLayout(params_layout)
+        content_layout.addWidget(params_widget)
+
+        layout.addLayout(content_layout)
 
         return group
+
+    @property
+    def current_tolerance(self) -> float:
+        """Единый источник правды для текущей точности сравнения"""
+        return self.tolerance_spin.value() / 1_000_000
 
     def _add_schema_column(self):
         """Добавление столбца в таблицу схемы"""
@@ -1226,7 +1315,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Уникальность ключей", "Ключи уникальны в обоих датафреймах!")
 
     def _check_uniqueness_chunked(self, key_columns: List[str]):
-        """Проверка уникальности ключей напрямую из CSV-файлов через SQLite"""
+        """Проверка уникальности ключей напрямую из CSV-файлов через SQLite (чанки)"""
         path1 = self.file1_path.text().strip()
         path2 = self.file2_path.text().strip()
         
@@ -1248,43 +1337,95 @@ class MainWindow(QMainWindow):
         conn = sqlite3.connect(":memory:")
         try:
             for file_path, label in [(path1, "первого файла"), (path2, "второго файла")]:
-                self.log(f"  Загрузка {label}...")
+                self.log(f"  Загрузка {label} чанками...")
                 try:
-                    df = pd.read_csv(file_path, usecols=key_columns, dtype=str, encoding='utf-8', sep=sep)
+                    # Создаём временную таблицу
+                    tbl = "keys_tmp"
+                    conn.execute(f"CREATE TABLE {tbl} (_key TEXT PRIMARY KEY, row_data TEXT)")
+                    conn.commit()
+                    
+                    chunksize = 100000
+                    total_rows = 0
+                    dup_samples = []
+                    
+                    # Читаем чанками
+                    for chunk in pd.read_csv(file_path, 
+                                             usecols=key_columns,
+                                             dtype=str,
+                                             encoding='utf-8',
+                                             sep=sep,
+                                             chunksize=chunksize):
+                        total_rows += len(chunk)
+                        
+                        # Создаём составной ключ
+                        chunk['_key'] = chunk[key_columns].agg(lambda row: '\x01'.join(str(v) for v in row), axis=1)
+                        chunk['row_data'] = chunk[key_columns].agg(lambda row: '\x01'.join(str(v) for v in row), axis=1)
+                        
+                        # Вставляем чанк
+                        data = chunk[['_key', 'row_data']].values.tolist()
+                        conn.executemany(f"INSERT OR REPLACE INTO {tbl} VALUES (?, ?)", data)
+                    
+                    conn.commit()
+                    
+                    if total_rows == 0:
+                        self.log(f"  ⚠️ {label} пуст")
+                        continue
+                    
+                    # SQL-запрос для поиска дубликатов
+                    dup_query = f"""
+                        SELECT _key, COUNT(*) as cnt
+                        FROM {tbl}
+                        GROUP BY _key
+                        HAVING cnt > 1
+                    """
+                    cursor = conn.execute(dup_query)
+                    dup_rows = cursor.fetchall()
+                    
+                    if not dup_rows:
+                        self.log(f"  ✓ {label}: ключи уникальны ({total_rows} строк)")
+                    else:
+                        total_dup_keys = len(dup_rows)
+                        
+                        # Общее количество строк с дубликатами
+                        dup_rows_count_query = f"""
+                            SELECT COUNT(*) FROM {tbl}
+                            WHERE _key IN (SELECT _key FROM {tbl} GROUP BY _key HAVING COUNT(*) > 1)
+                        """
+                        dup_rows_count = conn.execute(dup_rows_count_query).fetchone()[0]
+                        
+                        self.log(f"  ⚠️ {label}: обнаружено {total_dup_keys} неуникальных ключей ({dup_rows_count} строк)", is_error=True)
+                        
+                        # Показываем первые 50 неуникальных ключей
+                        lines = [f"    {'Ключ':<60} {'Кол-во':>6}"]
+                        for key, cnt in dup_rows[:50]:
+                            lines.append(f"    {key:<60} {cnt:>6}")
+                        if total_dup_keys > 50:
+                            lines.append(f"    ... и ещё {total_dup_keys - 50} ключей")
+                        self.log("\n".join(lines))
+                        
+                        # Показываем примеры дублирующихся строк
+                        sample_query = f"""
+                            SELECT _key FROM {tbl}
+                            WHERE _key IN (SELECT _key FROM {tbl} GROUP BY _key HAVING COUNT(*) > 1)
+                            LIMIT 20
+                        """
+                        sample_keys = [r[0] for r in conn.execute(sample_query).fetchall()]
+                        
+                        if sample_keys:
+                            # Парсим ключи обратно в DataFrame
+                            sample_dicts = []
+                            for key in sample_keys:
+                                vals = key.split('\x01')
+                                sample_dicts.append(dict(zip(key_columns, vals)))
+                            sample_df = pd.DataFrame(sample_dicts)
+                            self._show_duplicates_table(sample_df, f"Дубликаты в {label}")
+                    
+                    # Удаляем временную таблицу
+                    conn.execute(f"DROP TABLE {tbl}")
+                
                 except Exception as e:
-                    self.log(f"  ⚠️ Не удалось прочитать столбцы {key_columns} из {file_path}: {e}", is_error=True)
+                    self.log(f"  ⚠️ Ошибка обработки {file_path}: {e}", is_error=True)
                     continue
-                
-                if df.empty:
-                    self.log(f"  ⚠️ {label} пуст")
-                    continue
-                
-                # Создаём составной ключ
-                df['_key'] = df[key_columns].astype(str).agg(lambda row: '\x01'.join(row.astype(str)), axis=1)
-                
-                # Ищем дубликаты
-                dups = df[df['_key'].duplicated(keep=False)]
-                
-                if dups.empty:
-                    self.log(f"  ✓ {label}: ключи уникальны ({len(df)} строк)")
-                else:
-                    dup_keys_df = dups['_key'].value_counts().reset_index()
-                    dup_keys_df.columns = ['key', 'count']
-                    total_dup_keys = len(dup_keys_df)
-                    total_dup_rows = len(dups)
-                    self.log(f"  ⚠️ {label}: обнаружено {total_dup_keys} неуникальных ключей ({total_dup_rows} строк)", is_error=True)
-                    
-                    # Показываем первые 50 неуникальных ключей
-                    preview = dup_keys_df.head(50)
-                    lines = [f"    {'Ключ':<60} {'Кол-во':>6}"]
-                    lines += [f"    {row['key']:<60} {row['count']:>6}" for _, row in preview.iterrows()]
-                    if len(dup_keys_df) > 50:
-                        lines.append(f"    ... и ещё {len(dup_keys_df) - 50} ключей")
-                    self.log("\n".join(lines))
-                    
-                    # Показываем примеры дублирующихся строк
-                    sample = dups.head(20).drop(columns=['_key'])
-                    self._show_duplicates_table(sample, f"Дубликаты в {label}")
             
             QMessageBox.information(self, "Уникальность ключей", "Проверка завершена. Результаты в логе.")
         finally:
@@ -1335,6 +1476,11 @@ class MainWindow(QMainWindow):
         self.schema_combo.clear()
         schema_names = self.schema_manager.get_schema_names()
         self.schema_combo.addItems(schema_names)
+        
+        # Если ничего не выбрано и есть схемы — выбираем первую
+        if schema_names and self.schema_combo.currentIndex() == -1:
+            self.schema_combo.setCurrentIndex(0)
+        
         self.schema_combo.blockSignals(False)  # включаем обратно
 
 
@@ -1355,7 +1501,19 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Ошибка", f"Не удалось открыть файл: {e}")
         else:
             QMessageBox.warning(self, "Предупреждение", f"Файл схем не найден: {schema_file}")
- 
+    
+    def _open_readme_in_vscode(self):
+        """Открытие справки в диалоговом окне"""
+        if not Path(__file__).parent.joinpath("README.md").exists():
+            QMessageBox.warning(self, "Предупреждение", f"Файл справки не найден: README.md")
+            return
+        if not hasattr(self, '_help_dialog') or self._help_dialog is None:
+            self._help_dialog = HelpDialog(self)
+            self._help_dialog.finished.connect(lambda: setattr(self, "_help_dialog", None))
+        self._help_dialog.show()
+        self._help_dialog.raise_()
+        self._help_dialog.activateWindow()
+
 
     def apply_schema_template(self, schema_name: str):
         """Применение шаблона схемы"""
@@ -1368,13 +1526,12 @@ class MainWindow(QMainWindow):
         
         self.current_schema = schema_data.get('schema', {}).copy()
         self.current_compare_columns = schema_data.get('key_columns', []).copy()
-        self.current_tolerance = schema_data.get('tolerance', 0.0)
         
         # Отображаем схему в таблице
         self._set_schema_to_table(self.current_schema, self.current_compare_columns)
         
-        # Устанавливаем точность
-        tolerance_value = int(self.current_tolerance * 1000000)
+        # Устанавливаем точность из схемы
+        tolerance_value = int(schema_data.get('tolerance', 0.0) * 1000000)
         self.tolerance_spin.setValue(tolerance_value)
         
         self.log(f"Применена схема: {schema_name} (точность: {self.current_tolerance})")
@@ -1391,7 +1548,6 @@ class MainWindow(QMainWindow):
             
             self.current_schema = schema
             self.current_compare_columns = self._get_key_columns_from_table()
-            self.current_tolerance = self.tolerance_spin.value() / 1_000_000
             
             self.log(f"Применена пользовательская схема ({len(schema)} столбцов, точность: {self.current_tolerance})")
             
@@ -1409,7 +1565,7 @@ class MainWindow(QMainWindow):
                 return
             
             key_columns = self._get_key_columns_from_table()
-            tolerance = self.tolerance_spin.value() / 1_000_000
+            tolerance = self.current_tolerance
             
             schema_name = self.schema_combo.currentText()
             
@@ -1446,7 +1602,7 @@ class MainWindow(QMainWindow):
         """Добавление новой схемы"""
         schema = self._get_schema_from_table()
         key_columns = self._get_key_columns_from_table()
-        tolerance = self.tolerance_spin.value() / 1_000_000
+        tolerance = self.current_tolerance
         
         if not schema:
             QMessageBox.warning(self, "Предупреждение", "Схема пуста! Добавьте столбцы.")
@@ -1782,7 +1938,7 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-        tolerance = self.tolerance_spin.value() / 1_000_000
+        tolerance = self.current_tolerance
 
         # --- АГРЕГАЦИЯ (если включена) ---
         # Агрегация выполняется внутри компаратора (InMemoryComparator или ChunkedComparator)
@@ -2099,7 +2255,7 @@ class MainWindow(QMainWindow):
                         elif pd.isna(val1) or pd.isna(val2):
                             are_equal = False
                         elif isinstance(val1, (int, float)) and isinstance(val2, (int, float)):
-                            tolerance = self.tolerance_spin.value() / 1_000_000
+                            tolerance = self.current_tolerance
                             are_equal = abs(float(val1) - float(val2)) <= tolerance
                         else:
                             are_equal = str(val1) == str(val2)
@@ -2156,58 +2312,93 @@ class MainWindow(QMainWindow):
         # Используем выбранный каталог
         output_dir = self.output_dir
         
+        # Лимит строк на вкладку Excel (openpyxl падает на больших файлах)
+        EXCEL_ROW_LIMIT = 1_000_000
+        
         try:
             # Создаем подкаталог с меткой времени
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_dir = output_dir / f"comparison_{timestamp}"
             save_dir.mkdir(parents=True, exist_ok=True)
             
-            # Единый Excel-файл с вкладками
             excel_path = (save_dir / f"report_{timestamp}.xlsx").resolve()
+            csv_path = (save_dir / f"report_{timestamp}.csv").resolve()
             
-            with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                sheet_num = 1
-                
-                if not self.comparator.df1_only.empty:
-                    self.comparator.df1_only.to_excel(
-                        writer, sheet_name=f"Только в df1 ({len(self.comparator.df1_only)})", index=False
-                    )
-                    sheet_num += 1
-                
-                if not self.comparator.df2_only.empty:
-                    self.comparator.df2_only.to_excel(
-                        writer, sheet_name=f"Только в df2 ({len(self.comparator.df2_only)})", index=False
-                    )
-                    sheet_num += 1
-                
-                if self.comparator.df1_df2_value is not None and not self.comparator.df1_df2_value.empty:
-                    self.comparator.df1_df2_value.to_excel(
-                        writer, sheet_name=f"Различия ({len(self.comparator.df1_df2_value)})", index=False
-                    )
-                    sheet_num += 1
-                
-                # Сводка
-                summary_data = {
-                    "Параметр": [
-                        "Файл 1 (строк)",
-                        "Файл 2 (строк)",
-                        "Только в df1",
-                        "Только в df2",
-                        "Различия в значениях",
-                        "Время сравнения"
-                    ],
-                    "Значение": [
-                        str(len(self.df1)) if self.df1 is not None else "N/A",
-                        str(len(self.df2)) if self.df2 is not None else "N/A",
-                        str(len(self.comparator.df1_only)),
-                        str(len(self.comparator.df2_only)),
-                        str(len(self.comparator.df1_df2_value)) if self.comparator.df1_df2_value is not None else "0",
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    ]
-                }
-                pd.DataFrame(summary_data).to_excel(writer, sheet_name="Сводка", index=False)
+            # Собираем данные для сводки
+            summary_data = {
+                "Параметр": [
+                    "Файл 1 (строк)",
+                    "Файл 2 (строк)",
+                    "Только в df1",
+                    "Только в df2",
+                    "Различия в значениях",
+                    "Время сравнения"
+                ],
+                "Значение": [
+                    str(len(self.df1)) if self.df1 is not None else "N/A",
+                    str(len(self.df2)) if self.df2 is not None else "N/A",
+                    str(len(self.comparator.df1_only)),
+                    str(len(self.comparator.df2_only)),
+                    str(len(self.comparator.df1_df2_value)) if self.comparator.df1_df2_value is not None else "0",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ]
+            }
             
-            self.log(f"Сохранено: {excel_path}")
+            # Определяем, что сохранять (Excel или CSV)
+            df1_only = self.comparator.df1_only
+            df2_only = self.comparator.df2_only
+            df1_df2_value = self.comparator.df1_df2_value
+            
+            # Если любой набор превышает лимит — пишем в CSV
+            use_excel = (
+                (df1_only.empty or len(df1_only) <= EXCEL_ROW_LIMIT) and
+                (df2_only.empty or len(df2_only) <= EXCEL_ROW_LIMIT) and
+                (df1_df2_value is None or df1_df2_value.empty or len(df1_df2_value) <= EXCEL_ROW_LIMIT)
+            )
+            
+            sheet_num = 1
+            
+            if use_excel:
+                # Excel — для небольших наборов данных
+                with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                    if not df1_only.empty:
+                        df1_only.to_excel(writer, sheet_name=f"Только в df1 ({len(df1_only)})", index=False)
+                        sheet_num += 1
+                    
+                    if not df2_only.empty:
+                        df2_only.to_excel(writer, sheet_name=f"Только в df2 ({len(df2_only)})", index=False)
+                        sheet_num += 1
+                    
+                    if df1_df2_value is not None and not df1_df2_value.empty:
+                        df1_df2_value.to_excel(writer, sheet_name=f"Различия ({len(df1_df2_value)})", index=False)
+                        sheet_num += 1
+                    
+                    summary_data["Параметр"].append("Время сравнения")
+                    pd.DataFrame(summary_data).to_excel(writer, sheet_name="Сводка", index=False)
+                
+                saved_path = excel_path
+                saved_format = "Excel"
+            else:
+                # CSV — для больших наборов данных
+                if not df1_only.empty:
+                    df1_only.to_csv(save_dir / "df1_only.csv", index=False, encoding='utf-8-sig')
+                    sheet_num += 1
+                
+                if not df2_only.empty:
+                    df2_only.to_csv(save_dir / "df2_only.csv", index=False, encoding='utf-8-sig')
+                    sheet_num += 1
+                
+                if df1_df2_value is not None and not df1_df2_value.empty:
+                    df1_df2_value.to_csv(save_dir / "df1_df2_value.csv", index=False, encoding='utf-8-sig')
+                    sheet_num += 1
+                
+                # Сводка в CSV
+                pd.DataFrame(summary_data).to_csv(save_dir / "summary.csv", index=False, encoding='utf-8-sig')
+                
+                saved_path = save_dir
+                saved_format = "CSV"
+            
+            self.log(f"Сохранено: {saved_path} ({saved_format})")
 
             # Для чанкового режима копируем ПОЛНЫЕ результаты из временного
             # каталога (в comparator.df1_only/df2_only/diff лежит только
@@ -2224,7 +2415,6 @@ class MainWindow(QMainWindow):
                     self.log(f"Скопированы полные результаты ({len(copied)} файлов):")
                     for c in copied:
                         self.log(f"  {c}")
-                        
             
             # Сохраняем информацию о предупреждениях, если они были
             if self.key_uniqueness_warnings:
@@ -2237,17 +2427,22 @@ class MainWindow(QMainWindow):
                         f.write("\n" + "=" * 80 + "\n\n")
                 self.log(f"Сохранено: {warnings_path}")
             
+            # Формируем сообщение
+            if use_excel:
+                msg = f"Результаты сохранены в:\n{saved_path}\n\nФайл содержит {sheet_num} вкладок."
+            else:
+                msg = f"Результаты сохранены в:\n{saved_path}\n\nФормат: CSV\nФайлов: {sheet_num}"
+            
             reply = QMessageBox.information(
                 self, "Сохранение",
-                f"Результаты сохранены в:\n{excel_path}\n\n"
-                f"Файл содержит {sheet_num} вкладок с результатами сравнения.",
+                msg + "\n\nОткрыть папку?",
                 QMessageBox.Ok | QMessageBox.Open
             )
             
             if reply == QMessageBox.Open:
                 from PySide6.QtCore import QUrl
                 from PySide6.QtGui import QDesktopServices
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(excel_path.parent)))
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(save_dir)))
             
         except Exception as e:
             QMessageBox.critical(self, "Ошибка сохранения", str(e))
@@ -2313,7 +2508,11 @@ class MainWindow(QMainWindow):
                 if file2 and os.path.exists(file2):
                     self.file2_path.setText(file2)
                 if schema:
+                    self.schema_combo.blockSignals(True)
                     self.schema_combo.setCurrentText(schema)
+                    self.schema_combo.blockSignals(False)
+                    # Применяем восстановленную схему
+                    self.apply_schema_template(schema)
                 
                 # Восстанавливаем разделитель
                 if separator in [',', ';', '\t', '|']:

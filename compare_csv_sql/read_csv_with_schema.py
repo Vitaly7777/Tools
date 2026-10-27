@@ -10,13 +10,18 @@ def read_csv_with_schema_v1(
     """
     Считывает CSV файл с указанной схемой типов данных.
     
+    Использует pandas nullable-типы для NaN-устойчивости:
+    - 'int' → 'Int64' (позволяет NaN)
+    - 'bool' → 'boolean' (позволяет NaN)
+    - 'float' → 'float64' (NaN уже поддерживается)
+    - 'string' → 'string' (по умолчанию)
+    
     Args:
         file_path: Путь к CSV файлу
         type_mapping: Словарь с маппингом названий столбцов на типы данных.
-                     Если None, используется значение по умолчанию.
-                     Пример: {"Столбец3": "float", "Столбец9": "int"}
+                      Пример: {"Столбец3": "float", "Столбец9": "int"}
         default_type: Тип данных по умолчанию для столбцов, не указанных в type_mapping
-                     По умолчанию "string"
+                      По умолчанию "string"
         **kwargs: Дополнительные параметры для pd.read_csv()
     
     Returns:
@@ -35,13 +40,27 @@ def read_csv_with_schema_v1(
     if type_mapping is None:
         type_mapping = {}
     
+    # Маппинг логических типов на pandas nullable-типы
+    # Int64 (заглавная I) и boolean — поддерживают NaN
+    NAIVE_TYPE_MAP = {
+        'int': 'Int64',
+        'float': 'float64',
+        'bool': 'boolean',
+        'string': 'string',
+    }
+    
+    def resolve_dtype(col_type: str) -> str:
+        """Преобразует логический тип в безопасный pandas dtype."""
+        resolved = NAIVE_TYPE_MAP.get(col_type)
+        if resolved is None:
+            raise ValueError(
+                f"Неподдерживаемый тип '{col_type}'. "
+                f"Поддерживаемые: {', '.join(NAIVE_TYPE_MAP.keys())}"
+            )
+        return resolved
+    
     try:
-        # Сначала читаем файл без типизации для получения названий столбцов
-        # df_temp = pd.read_csv(file_path, nrows=0)
-        # Сначала читаем файл без типизации для получения названий столбцов.
-        # ВАЖНО: sep/encoding должны совпадать с финальным чтением,
-        # иначе заголовки распарсятся неверно (например, "a;b" станет одним
-        # столбцом) и dtype-схема не применится ни к одному столбцу.
+        # Считываем заголовки — sep/encoding должны совпадать с финальным чтением
         header_kwargs = {
             k: v for k, v in kwargs.items()
             if k in ('sep', 'delimiter', 'encoding', 'sep_whitespace', 'quotechar')
@@ -49,14 +68,11 @@ def read_csv_with_schema_v1(
         df_temp = pd.read_csv(file_path, nrows=0, **header_kwargs)        
         columns = df_temp.columns.tolist()
         
-        # Создаем словарь dtype для всех столбцов
+        # Создаём словарь dtype с nullable-типами
         dtype_dict = {}
-        
         for column in columns:
-            if column in type_mapping:
-                dtype_dict[column] = type_mapping[column]
-            else:
-                dtype_dict[column] = default_type
+            raw_type = type_mapping.get(column, default_type)
+            dtype_dict[column] = resolve_dtype(raw_type)
         
         # Читаем файл с указанной типизацией
         df = pd.read_csv(file_path, dtype=dtype_dict, **kwargs)
@@ -79,10 +95,12 @@ def read_csv_with_schema_v2(
     """
     Альтернативная версия с более подробной обработкой типов.
     
+    Использует pandas nullable-типы для NaN-устойчивости.
+    
     Args:
         file_path: Путь к CSV файлу
         type_mapping: Словарь маппинга типов.
-                     Пример: {"Столбец3": "float", "Столбец9": "int"}
+                      Пример: {"Столбец3": "float", "Столбец9": "int"}
         **kwargs: Дополнительные параметры для pd.read_csv()
     
     Returns:
@@ -92,13 +110,13 @@ def read_csv_with_schema_v2(
     if type_mapping is None:
         type_mapping = {}
     
-    # Поддерживаемые типы данных
+    # Pandas nullable-типы — NaN-устойчивые
     supported_types = {
-        "string": str,
-        "int": int,
-        "float": float,
-        "bool": bool,
-        "datetime": "datetime64[ns]"
+        "string": "string",
+        "int": "Int64",       # nullable integer
+        "float": "float64",   # NaN уже поддерживается
+        "bool": "boolean",    # nullable boolean
+        "datetime": "string", # datetime из CSV — читай как string, потом парси
     }
     
     # Валидация типов в type_mapping
@@ -110,19 +128,21 @@ def read_csv_with_schema_v2(
             )
     
     try:
-        # Читаем первую строку для получения названий столбцов
-        df_temp = pd.read_csv(file_path, nrows=0)
+        # Определяем header_kwargs для чтения заголовков
+        header_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k in ('sep', 'delimiter', 'encoding', 'sep_whitespace', 'quotechar')
+        }
+        df_temp = pd.read_csv(file_path, nrows=0, **header_kwargs)
         columns = df_temp.columns.tolist()
         
-        # Создаем словарь dtype
+        # Создаём словарь dtype — nullable-типы
         dtype_dict = {}
-        
         for column in columns:
             if column in type_mapping:
-                mapped_type = type_mapping[column]
-                dtype_dict[column] = supported_types[mapped_type]
+                dtype_dict[column] = supported_types[type_mapping[column]]
             else:
-                dtype_dict[column] = str  # По умолчанию string
+                dtype_dict[column] = "string"
         
         # Читаем файл
         df = pd.read_csv(file_path, dtype=dtype_dict, **kwargs)
@@ -152,20 +172,20 @@ def read_csv_with_schema_v2(
 
 def read_csv_with_schema_v3(
     file_path: str,
-    type_mapping: Optional[Dict[str, type]] = None,
-    default_type: type = str,
+    type_mapping: Optional[Dict[str, str]] = None,
+    default_type: str = "string",
     encoding: str = "utf-8",
     sep: str = ",",
     **kwargs
 ) -> pd.DataFrame:
     """
-    Версия с использованием типов Python напрямую.
+    Версия с использованием pandas nullable-типов напрямую.
     
     Args:
         file_path: Путь к CSV файлу
-        type_mapping: Словарь маппинга типов Python.
-                     Пример: {"Столбец3": float, "Столбец9": int}
-        default_type: Тип данных по умолчанию (используется type Python)
+        type_mapping: Словарь маппинга типов.
+                      Пример: {"Столбец3": "float", "Столбец9": "int"}
+        default_type: Тип данных по умолчанию
         encoding: Кодировка файла (по умолчанию utf-8)
         sep: Разделитель CSV (по умолчанию запятая)
         **kwargs: Дополнительные параметры для pd.read_csv()
@@ -177,6 +197,23 @@ def read_csv_with_schema_v3(
     if type_mapping is None:
         type_mapping = {}
     
+    # Pandas nullable-типы
+    NAIVE_TYPE_MAP = {
+        'int': 'Int64',
+        'float': 'float64',
+        'bool': 'boolean',
+        'string': 'string',
+    }
+    
+    def resolve_dtype(col_type: str) -> str:
+        resolved = NAIVE_TYPE_MAP.get(col_type)
+        if resolved is None:
+            raise ValueError(
+                f"Неподдерживаемый тип '{col_type}'. "
+                f"Поддерживаемые: {', '.join(NAIVE_TYPE_MAP.keys())}"
+            )
+        return resolved
+    
     try:
         # Читаем первую строку для получения названий столбцов
         df_temp = pd.read_csv(
@@ -187,14 +224,13 @@ def read_csv_with_schema_v3(
         )
         columns = df_temp.columns.tolist()
         
-        # Создаем словарь dtype
+        # Создаём словарь dtype — nullable-типы
         dtype_dict = {}
-        
         for column in columns:
             if column in type_mapping:
-                dtype_dict[column] = type_mapping[column]
+                dtype_dict[column] = resolve_dtype(type_mapping[column])
             else:
-                dtype_dict[column] = default_type
+                dtype_dict[column] = resolve_dtype(default_type)
         
         # Читаем файл с полной типизацией
         df = pd.read_csv(
@@ -215,7 +251,7 @@ def read_csv_with_schema_v3(
         print("-" * 60)
         
         for column in df.columns:
-            original_type = type_mapping.get(column, default_type).__name__
+            original_type = type_mapping.get(column, default_type)
             actual_type = str(df[column].dtype)
             status = "✓" if str(original_type).lower() in actual_type.lower() or \
                            (original_type == "str" and actual_type == "object") else "⚠"
@@ -289,3 +325,4 @@ if __name__ == "__main__":
     # Очистка
     if os.path.exists(sample_csv):
         os.remove(sample_csv)
+
