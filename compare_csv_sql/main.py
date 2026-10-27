@@ -1,7 +1,6 @@
 import sys
 import os
 import json
-# import hashlib
 import sqlite3
 import subprocess 
 from pathlib import Path
@@ -23,7 +22,7 @@ from read_csv_with_schema import read_csv_with_schema_v1
 # ИЗМЕНЕНО: используем фабрику вместо прямого импорта класса
 from data_frame_comparator import create_comparator, InMemoryComparator
 # Общие утилиты
-from utils import parse_schema_text, parse_key_columns
+from utils import parse_schema_text, parse_key_columns, auto_detect_separator
 
 
 class SchemaManager:
@@ -202,82 +201,6 @@ class SchemaManager:
     def get_schema_file_path(self) -> str:
         """Получение пути к файлу схем"""
         return self.schema_file
-
-
-def check_key_uniqueness(df: pd.DataFrame, key_columns: List[str], df_name: str = "") -> Tuple[bool, List[Tuple]]:
-    """
-    Проверка уникальности ключа в датафрейме
-    
-    Args:
-        df: Датафрейм для проверки
-        key_columns: Список ключевых столбцов
-        df_name: Имя датафрейма для сообщения
-    
-    Returns:
-        Tuple[bool, List[Tuple]]: (уникален ли ключ, список неуникальных ключей)
-    """
-    if not key_columns:
-        return True, []
-    
-    # Проверяем, что все ключевые столбцы есть в датафрейме
-    missing_columns = [col for col in key_columns if col not in df.columns]
-    if missing_columns:
-        return True, []  # Пропускаем проверку если нет столбцов
-    
-    # Создаем составной ключ с SEP='\x01' (не встречается в обычных данных)
-    df_temp = df.copy()
-    df_temp['_composite_key'] = df_temp[key_columns].astype(str).agg('\x01'.join, axis=1)
-    
-    # Находим дубликаты
-    duplicates = df_temp['_composite_key'].duplicated(keep=False)
-    
-    if duplicates.any():
-        # Получаем неуникальные ключи
-        duplicate_keys = df_temp[duplicates]['_composite_key'].unique().tolist()
-        
-        # Декодируем ключи обратно в кортежи
-        decoded_keys = []
-        for key in duplicate_keys:
-            values = key.split('\x01')
-            decoded_keys.append(tuple(values))
-        
-        return False, decoded_keys
-    
-    return True, []
-
-
-def find_duplicate_rows(df: pd.DataFrame, key_columns: List[str]) -> pd.DataFrame:
-    """
-    Поиск дублирующихся строк по ключу
-    
-    Args:
-        df: Датафрейм для проверки
-        key_columns: Список ключевых столбцов
-    
-    Returns:
-        pd.DataFrame: Датафрейм с дублирующимися строками
-    """
-    if not key_columns:
-        return pd.DataFrame()
-    
-    # Проверяем, что все ключевые столбцы есть в датафрейме
-    missing_columns = [col for col in key_columns if col not in df.columns]
-    if missing_columns:
-        return pd.DataFrame()
-    
-    # Находим дубликаты
-    duplicates = df[df.duplicated(subset=key_columns, keep=False)]
-    
-    if not duplicates.empty:
-        # Добавляем счетчик вхождений
-        duplicates = duplicates.copy()
-        duplicates['_count'] = duplicates.groupby(key_columns).cumcount() + 1
-        duplicates['_total'] = duplicates.groupby(key_columns)['_count'].transform('max')
-        
-        # Сортируем для удобства просмотра
-        duplicates = duplicates.sort_values(by=key_columns + ['_count'])
-    
-    return duplicates
 
 
 class SchemaEditorDialog(QDialog):
@@ -584,24 +507,6 @@ class CompareWorker(QThread):
         self.agg_func = agg_func
         self.log_callback = log_callback
     
-    def _auto_detect_separator(self, file_path: str) -> str:
-        """Автоопределение разделителя CSV файла"""
-        try:
-            with open(file_path, 'r', encoding=self.encoding) as f:
-                sample = f.read(8192)
-            candidates = {
-                ',': sample.count(','),
-                ';': sample.count(';'),
-                '\t': sample.count('\t'),
-                '|': sample.count('|')
-            }
-            best_sep = max(candidates, key=candidates.get)
-            if candidates[best_sep] >= 3:
-                return best_sep
-        except Exception:
-            pass
-        return ','
-    
     def run(self):
         comparator = None 
         try:
@@ -610,7 +515,7 @@ class CompareWorker(QThread):
             # Автоопределение разделителя для чанкового режима
             csv_separator = self.csv_separator
             if self.use_chunked and self.df1_path:
-                csv_separator = self._auto_detect_separator(self.df1_path)
+                csv_separator = auto_detect_separator(self.df1_path, self.encoding)
                 self.progress.emit(f"  Разделитель определён: '{csv_separator}'")
             
             # ИСПОЛЬЗУЕМ ФАБРИКУ
@@ -628,31 +533,30 @@ class CompareWorker(QThread):
                 agg_func=self.agg_func,
                 log_callback=lambda m, is_error=False: self.log_message.emit(m, is_error),
                 progress_callback=lambda fc, ft, gc, gt, fl: self.progress_chunk.emit(fc, ft, gc, gt, fl),
-                # log_callback=self.log_callback
             )
 
             if self.use_chunked:
                 self.progress.emit("Загрузка данных в БД (чанками)...")
                 comparator.load_data()
 
-                # Автоматическая проверка уникальности ключей
-                self.progress.emit("Проверка уникальности ключей...")
-                try:
-                    uniqueness_results, dup_samples = comparator.check_uniqueness()
-                    
-                    for table_name, result in uniqueness_results.items():
-                        if not result['unique']:
-                            # Отправляем предупреждение в UI
-                            msg = f"Обнаружены неуникальные ключи в {table_name}: {result['dup_keys']} ключей ({result['dup_rows']} строк)"
-                            self.key_uniqueness_warning.emit(msg, "")
-                            
-                            # Показываем примеры дубликатов через сигнал
-                            for sample_table, sample_df in dup_samples:
-                                if sample_table == table_name and not sample_df.empty:
-                                    self.duplicates_found.emit(table_name, sample_df)
-                except Exception as e:
-                    self.log_callback(f"  ⚠️ Ошибка проверки уникальности: {e}")
-                    # Продолжаем сравнение даже при ошибке проверки
+            # Автоматическая проверка уникальности ключей (для обоих режимов)
+            self.progress.emit("Проверка уникальности ключей...")
+            try:
+                uniqueness_results, dup_samples = comparator.check_uniqueness()
+                
+                for table_name, result in uniqueness_results.items():
+                    if not result['unique']:
+                        # Отправляем предупреждение в UI
+                        msg = f"Обнаружены неуникальные ключи в {table_name}: {result['dup_keys']} ключей ({result['dup_rows']} строк)"
+                        self.key_uniqueness_warning.emit(msg, "")
+                        
+                        # Показываем примеры дубликатов через сигнал
+                        for sample_table, sample_df in dup_samples:
+                            if sample_table == table_name and not sample_df.empty:
+                                self.duplicates_found.emit(table_name, sample_df)
+            except Exception as e:
+                self.log_callback(f"  ⚠️ Ошибка проверки уникальности: {e}")
+                # Продолжаем сравнение даже при ошибке проверки
 
             self.progress.emit("Выполнение сравнения...")
             if self.use_chunked:
@@ -1285,7 +1189,7 @@ class MainWindow(QMainWindow):
         use_chunked = self.chunked_checkbox.isChecked()
         
         if use_chunked:
-            # Чанковый режим: проверяем уникальность напрямую из CSV через SQLite
+            # Чанковый режим: создаём временный comparator для проверки
             self._check_uniqueness_chunked(key_columns)
         else:
             # In-memory режим: используем загруженные датафреймы
@@ -1296,25 +1200,28 @@ class MainWindow(QMainWindow):
 
     def _check_uniqueness_in_memory(self, key_columns: List[str]):
         """Проверка уникальности для загруженных в память датафреймов"""
-        is_unique_1, dup_keys_1 = check_key_uniqueness(self.df1, key_columns, "df1")
-        if not is_unique_1:
-            duplicates_df1 = find_duplicate_rows(self.df1, key_columns)
-            self.log(f"⚠️ В df1 обнаружено {len(dup_keys_1)} неуникальных ключей")
-            if not duplicates_df1.empty:
-                self._show_duplicates_table(duplicates_df1, "Дубликаты в df1")
-        else:
-            self.log("✓ Ключи в df1 уникальны")
+        # Создаём временный comparator для вызова check_uniqueness()
+        from data_frame_comparator import InMemoryComparator
+        tmp_comparator = InMemoryComparator(
+            self.df1, self.df2,
+            schema_default=self.current_schema,
+            compare_columns=key_columns,
+            log_callback=lambda m, is_error=False: self.log(m, is_error=is_error)
+        )
+        results, dup_samples = tmp_comparator.check_uniqueness()
         
-        is_unique_2, dup_keys_2 = check_key_uniqueness(self.df2, key_columns, "df2")
-        if not is_unique_2:
-            duplicates_df2 = find_duplicate_rows(self.df2, key_columns)
-            self.log(f"⚠️ В df2 обнаружено {len(dup_keys_2)} неуникальных ключей")
-            if not duplicates_df2.empty:
-                self._show_duplicates_table(duplicates_df2, "Дубликаты в df2")
-        else:
-            self.log("✓ Ключи в df2 уникальны")
+        has_warnings = False
+        for table_name, result in results.items():
+            if not result['unique']:
+                has_warnings = True
+                self.log(f"⚠️ В {table_name} обнаружено {result['dup_keys']} неуникальных ключей ({result['dup_rows']} строк)", is_error=True)
+                for sample_table, sample_df in dup_samples:
+                    if sample_table == table_name and not sample_df.empty:
+                        self._show_duplicates_table(sample_df, f"Дубликаты в {table_name}")
+            else:
+                self.log(f"✓ Ключи в {table_name} уникальны")
         
-        if is_unique_1 and is_unique_2:
+        if not has_warnings:
             QMessageBox.information(self, "Уникальность ключей", "Ключи уникальны в обоих датафреймах!")
 
     def _check_uniqueness_chunked(self, key_columns: List[str]):
@@ -1337,102 +1244,42 @@ class MainWindow(QMainWindow):
         if self.sep_auto_checkbox.isChecked():
             sep = self._auto_detect_separator(path1) or ","
         
-        conn = sqlite3.connect(":memory:")
+        # Создаём временный comparator для проверки уникальности
+        from data_frame_comparator import create_comparator
+        comparator = create_comparator(
+            None, None,
+            key_columns,
+            self.current_schema,
+            use_chunked=True,
+            df1_path=path1,
+            df2_path=path2,
+            separator=sep,
+            log_callback=lambda m, is_error=False: self.log(m, is_error=is_error)
+        )
         try:
-            for file_path, label in [(path1, "первого файла"), (path2, "второго файла")]:
-                self.log(f"  Загрузка {label} чанками...")
-                try:
-                    # Создаём временную таблицу
-                    tbl = "keys_tmp"
-                    conn.execute(f"CREATE TABLE {tbl} (_key TEXT PRIMARY KEY, row_data TEXT)")
-                    conn.commit()
-                    
-                    chunksize = 100000
-                    total_rows = 0
-                    dup_samples = []
-                    
-                    # Читаем чанками
-                    for chunk in pd.read_csv(file_path, 
-                                             usecols=key_columns,
-                                             dtype=str,
-                                             encoding='utf-8',
-                                             sep=sep,
-                                             chunksize=chunksize):
-                        total_rows += len(chunk)
-                        
-                        # Создаём составной ключ
-                        chunk['_key'] = chunk[key_columns].agg(lambda row: '\x01'.join(str(v) for v in row), axis=1)
-                        chunk['row_data'] = chunk[key_columns].agg(lambda row: '\x01'.join(str(v) for v in row), axis=1)
-                        
-                        # Вставляем чанк
-                        data = chunk[['_key', 'row_data']].values.tolist()
-                        conn.executemany(f"INSERT OR REPLACE INTO {tbl} VALUES (?, ?)", data)
-                    
-                    conn.commit()
-                    
-                    if total_rows == 0:
-                        self.log(f"  ⚠️ {label} пуст")
-                        continue
-                    
-                    # SQL-запрос для поиска дубликатов
-                    dup_query = f"""
-                        SELECT _key, COUNT(*) as cnt
-                        FROM {tbl}
-                        GROUP BY _key
-                        HAVING cnt > 1
-                    """
-                    cursor = conn.execute(dup_query)
-                    dup_rows = cursor.fetchall()
-                    
-                    if not dup_rows:
-                        self.log(f"  ✓ {label}: ключи уникальны ({total_rows} строк)")
-                    else:
-                        total_dup_keys = len(dup_rows)
-                        
-                        # Общее количество строк с дубликатами
-                        dup_rows_count_query = f"""
-                            SELECT COUNT(*) FROM {tbl}
-                            WHERE _key IN (SELECT _key FROM {tbl} GROUP BY _key HAVING COUNT(*) > 1)
-                        """
-                        dup_rows_count = conn.execute(dup_rows_count_query).fetchone()[0]
-                        
-                        self.log(f"  ⚠️ {label}: обнаружено {total_dup_keys} неуникальных ключей ({dup_rows_count} строк)", is_error=True)
-                        
-                        # Показываем первые 50 неуникальных ключей
-                        lines = [f"    {'Ключ':<60} {'Кол-во':>6}"]
-                        for key, cnt in dup_rows[:50]:
-                            lines.append(f"    {key:<60} {cnt:>6}")
-                        if total_dup_keys > 50:
-                            lines.append(f"    ... и ещё {total_dup_keys - 50} ключей")
-                        self.log("\n".join(lines))
-                        
-                        # Показываем примеры дублирующихся строк
-                        sample_query = f"""
-                            SELECT _key FROM {tbl}
-                            WHERE _key IN (SELECT _key FROM {tbl} GROUP BY _key HAVING COUNT(*) > 1)
-                            LIMIT 20
-                        """
-                        sample_keys = [r[0] for r in conn.execute(sample_query).fetchall()]
-                        
-                        if sample_keys:
-                            # Парсим ключи обратно в DataFrame
-                            sample_dicts = []
-                            for key in sample_keys:
-                                vals = key.split('\x01')
-                                sample_dicts.append(dict(zip(key_columns, vals)))
-                            sample_df = pd.DataFrame(sample_dicts)
-                            self._show_duplicates_table(sample_df, f"Дубликаты в {label}")
-                    
-                    # Удаляем временную таблицу
-                    conn.execute(f"DROP TABLE {tbl}")
-                
-                except Exception as e:
-                    self.log(f"  ⚠️ Ошибка обработки {file_path}: {e}", is_error=True)
-                    continue
+            # Загружаем только ключевые столбцы (минимальная нагрузка)
+            comparator.load_data()
             
-            QMessageBox.information(self, "Уникальность ключей", "Проверка завершена. Результаты в логе.")
+            # Проверяем уникальность
+            results, dup_samples = comparator.check_uniqueness()
+            
+            has_warnings = False
+            for table_name, result in results.items():
+                if not result['unique']:
+                    has_warnings = True
+                    self.log(f"⚠️ В {table_name} обнаружено {result['dup_keys']} неуникальных ключей ({result['dup_rows']} строк)", is_error=True)
+                    for sample_table, sample_df in dup_samples:
+                        if sample_table == table_name and not sample_df.empty:
+                            self._show_duplicates_table(sample_df, f"Дубликаты в {table_name}")
+                else:
+                    self.log(f"✓ Ключи в {table_name} уникальны")
+            
+            if not has_warnings:
+                QMessageBox.information(self, "Уникальность ключей", "Ключи уникальны в обоих файлах!")
+            else:
+                QMessageBox.information(self, "Уникальность ключей", "Проверка завершена. Результаты в логе.")
         finally:
-            conn.close()
+            comparator.close()
 
     def _show_duplicates_table(self, duplicates_df: pd.DataFrame, title: str):
         """Отображение таблицы с дубликатами"""
@@ -1725,25 +1572,17 @@ class MainWindow(QMainWindow):
         Возвращает обнаруженный разделитель или пустую строку при ошибке.
         """
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                sample = f.read(8192)
-            
-            # Считаем частоту каждого разделителя
-            candidates = {
-                ',': sample.count(','),
-                ';': sample.count(';'),
-                '\t': sample.count('\t'),
-                '|': sample.count('|')
-            }
-            
-            # Выбираем разделитель с максимальной частотой
-            best_sep = max(candidates, key=candidates.get)
-            best_count = candidates[best_sep]
+            best_sep = auto_detect_separator(file_path, 'utf-8')
             
             # Если лучший разделитель встречается менее 3 раз — считаем что разделитель не определён
-            if best_count < 3:
-                self.sep_auto_label.setText("—")
-                return ""
+            if best_sep == ',':
+                # auto_detect_separator вернёт ',' по умолчанию — проверим,
+                # что файл действительно содержит разделитель
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    sample = f.read(8192)
+                if sample.count(',') < 3 and sample.count(';') < 3 and sample.count('\t') < 3 and sample.count('|') < 3:
+                    self.sep_auto_label.setText("—")
+                    return ""
             
             # Отображаем обнаруженный разделитель
             sep_display = {',': ',', ';': ';', '\t': 'TAB', '|': '|'}
@@ -1758,19 +1597,6 @@ class MainWindow(QMainWindow):
             self.sep_auto_label.setText("ERR")
             return ""
     
-    def _update_separator_display(self):
-        """Обновление отображения разделителя при переключении авто/ручной режим"""
-        if self.sep_auto_checkbox.isChecked():
-            # Если выбран файл — определяем разделитель
-            file_path = self.file1_path.text() or self.file2_path.text()
-            if file_path and os.path.exists(file_path):
-                self._auto_detect_separator(file_path)
-            else:
-                self.sep_auto_label.setText("?")
-        else:
-            self.sep_auto_label.setText("")
-    
-
     def _select_output_dir(self):
         """Выбор каталога для результатов"""
         dir_path = QFileDialog.getExistingDirectory(
@@ -1861,40 +1687,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка загрузки", str(e))
             self.log(f"Ошибка загрузки: {e}", is_error=True)
 
-    def _aggregate_duplicates(self, df: pd.DataFrame, key_columns: List[str], agg_func: str):
-        """
-        Агрегирует дублирующиеся строки по ключевым столбцам, если все неключевые столбцы числовые.
-        
-        Returns:
-            (df_agg, error_msg) — если агрегация выполнена, error_msg = None;
-            если невозможна, возвращается (None, сообщение об ошибке).
-        """
-        if df is None or df.empty:
-            return df, None
-
-        # Проверяем наличие дубликатов по ключу
-        if not df.duplicated(subset=key_columns, keep=False).any():
-            return df, None  # дубликатов нет, возвращаем исходный df
-
-        non_key_cols = [col for col in df.columns if col not in key_columns]
-        if not non_key_cols:
-            # Все столбцы ключевые — просто удаляем дубликаты, оставляя первую запись
-            return df.drop_duplicates(subset=key_columns, keep='first'), None
-
-        # Проверяем, все ли неключевые столбцы числовые
-        non_numeric = [col for col in non_key_cols if not pd.api.types.is_numeric_dtype(df[col])]
-        if non_numeric:
-            msg = f"Невозможно агрегировать: нечисловые столбцы {non_numeric}"
-            return None, msg
-
-        # Выполняем агрегацию
-        try:
-            agg_dict = {col: agg_func for col in non_key_cols}
-            df_agg = df.groupby(key_columns, as_index=False).agg(agg_dict)
-            return df_agg, None
-        except Exception as e:
-            return None, f"Ошибка агрегации: {e}"
-
     # ИЗМЕНЕНО: запуск сравнения с передачей параметров чанкового режима
     def _start_comparison(self):
         """Запуск сравнения с возможной агрегацией дубликатов и чанковым режимом"""
@@ -1913,16 +1705,6 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.log(f"Не удалось освободить предыдущий компаратор: {e}", is_error=True)
             self.comparator = None
-
-        # # Парсим ключевые столбцы из таблицы схемы
-        # self.current_compare_columns = self._get_key_columns_from_table()
-
-        # if not self.current_compare_columns:
-        #     QMessageBox.warning(self, "Предупреждение", "Укажите ключевые столбцы!")
-        #     return
-
-        # # Проверка наличия столбцов в схеме
-        # for col in self.current_compare_columns:
 
         # ВАЖНО: перечитываем схему и ключи из таблицы на каждом запуске.
         # Иначе пользователь редактирует таблицу, но сравнение идёт по схеме,
@@ -2065,13 +1847,14 @@ class MainWindow(QMainWindow):
                 # Показываем все вкладки с дубликатами (они уже добавлены через _on_duplicates_found)
                 pass  # Вкладки с дубликатами уже добавлены в results_tabs
 
-        total_diffs = 0
-        if not comparator.df1_only.empty:
-            total_diffs += len(comparator.df1_only)
-        if not comparator.df2_only.empty:
-            total_diffs += len(comparator.df2_only)
-        if comparator.df1_df2_value is not None:
-            total_diffs += len(comparator.df1_df2_value)
+        # Для чанкового режима используем реальные totals, а не len(df) (который усечён)
+        is_chunked = hasattr(comparator, '_total_only1')
+        
+        total_df1_only = getattr(comparator, '_total_only1', len(comparator.df1_only)) if is_chunked else len(comparator.df1_only)
+        total_df2_only = getattr(comparator, '_total_only2', len(comparator.df2_only)) if is_chunked else len(comparator.df2_only)
+        total_diff = getattr(comparator, '_total_diff', len(comparator.df1_df2_value) if comparator.df1_df2_value is not None else 0) if is_chunked else (len(comparator.df1_df2_value) if comparator.df1_df2_value is not None else 0)
+        
+        total_diffs = total_df1_only + total_df2_only + total_diff
 
         message_parts = []
         if self.key_uniqueness_warnings:
@@ -2091,9 +1874,9 @@ class MainWindow(QMainWindow):
                 "\n".join(message_parts) +
                 f"\n\nСравнение завершено!\n"
                 f"Найдено отличий: {total_diffs}\n"
-                f"  - Только в df1: {len(comparator.df1_only)}\n"
-                f"  - Только в df2: {len(comparator.df2_only)}\n"
-                f"  - Различия в значениях: {len(comparator.df1_df2_value) if comparator.df1_df2_value is not None else 0}"
+                f"  - Только в df1: {total_df1_only}\n"
+                f"  - Только в df2: {total_df2_only}\n"
+                f"  - Различия в значениях: {total_diff}"
             )
 
     def _on_comparison_error(self, error_msg):
@@ -2112,20 +1895,36 @@ class MainWindow(QMainWindow):
         if self.comparator is None:
             return
         
+        # Получаем реальные totals для чанкового режима
+        is_chunked = hasattr(self.comparator, '_total_only1')
+        
+        # В чанковом режиме читаем ПОЛНЫЕ результаты из временных CSV файлов
+        if is_chunked:
+            saved_files = {}
+            if hasattr(self.comparator, 'get_saved_files'):
+                for fpath in self.comparator.get_saved_files():
+                    if os.path.exists(fpath):
+                        fname = os.path.basename(fpath)
+                        saved_files[fname] = fpath
+            
+            df1_only_full = pd.read_csv(saved_files.get('df1_only.csv'), encoding='utf-8-sig') if 'df1_only.csv' in saved_files else pd.DataFrame()
+            df2_only_full = pd.read_csv(saved_files.get('df2_only.csv'), encoding='utf-8-sig') if 'df2_only.csv' in saved_files else pd.DataFrame()
+            diff_full = pd.read_csv(saved_files.get('differences.csv'), encoding='utf-8-sig') if 'differences.csv' in saved_files else None
+        else:
+            df1_only_full = self.comparator.df1_only
+            df2_only_full = self.comparator.df2_only
+            diff_full = self.comparator.df1_df2_value
+        
+        # Получаем реальные totals для названий вкладок
+        total_df1_only = getattr(self.comparator, '_total_only1', len(df1_only_full)) if is_chunked else len(df1_only_full)
+        total_df2_only = getattr(self.comparator, '_total_only2', len(df2_only_full)) if is_chunked else len(df2_only_full)
+        total_diff = getattr(self.comparator, '_total_diff', len(diff_full)) if is_chunked and diff_full is not None else (len(diff_full) if diff_full is not None else 0)
+        
         # Таблица "Только в df1"
-        if not self.comparator.df1_only.empty:
-            is_chunked = hasattr(self.comparator, '_truncated_df1_only')
-            if is_chunked and self.comparator._truncated_df1_only:
-                # info_text = f"Показаны первые {len(self.comparator.df1_only)} строк (усечено из M, чанковый режим)"
-                # info_text = f"Показаны первые {len(self.comparator.df1_only)} строк (усечено из M, чанковый режим)"
-                total = getattr(self.comparator, '_total_only1', '?')
-                info_text = f"Показаны первые {len(self.comparator.df1_only)} из {total} строк (чанковый режим)"                
-            else:
-                info_text = None
-            tab1 = self._create_table_widget(self.comparator.df1_only, self.max_display_rows, info_text)
-            truncated = is_chunked and self.comparator._truncated_df1_only
-            tab_title = f"⚠ " if truncated else ""
-            self.results_tabs.addTab(tab1, f"{tab_title}Только в df1 ({len(self.comparator.df1_only)})")
+        if not df1_only_full.empty:
+            tab1 = self._create_table_widget(df1_only_full, show_all=is_chunked)
+            tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df1_only else ""
+            self.results_tabs.addTab(tab1, f"{tab_title}Только в df1 ({total_df1_only})")
         else:
             tab1 = QWidget()
             tab1_layout = QVBoxLayout(tab1)
@@ -2133,18 +1932,10 @@ class MainWindow(QMainWindow):
             self.results_tabs.addTab(tab1, "Только в df1 (0)")
         
         # Таблица "Только в df2"
-        if not self.comparator.df2_only.empty:
-            is_chunked = hasattr(self.comparator, '_truncated_df2_only')
-            if is_chunked and self.comparator._truncated_df2_only:
-                # info_text = f"Показаны первые {len(self.comparator.df2_only)} строк (усечено из M, чанковый режим)"
-                total = getattr(self.comparator, '_total_only2', '?')
-                info_text = f"Показаны первые {len(self.comparator.df2_only)} из {total} строк (чанковый режим)"                   
-            else:
-                info_text = None
-            tab2 = self._create_table_widget(self.comparator.df2_only, self.max_display_rows, info_text)
-            truncated = is_chunked and self.comparator._truncated_df2_only
-            tab_title = f"⚠ " if truncated else ""
-            self.results_tabs.addTab(tab2, f"{tab_title}Только в df2 ({len(self.comparator.df2_only)})")
+        if not df2_only_full.empty:
+            tab2 = self._create_table_widget(df2_only_full, show_all=is_chunked)
+            tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df2_only else ""
+            self.results_tabs.addTab(tab2, f"{tab_title}Только в df2 ({total_df2_only})")
         else:
             tab2 = QWidget()
             tab2_layout = QVBoxLayout(tab2)
@@ -2152,18 +1943,10 @@ class MainWindow(QMainWindow):
             self.results_tabs.addTab(tab2, "Только в df2 (0)")
         
         # Таблица "Различия в значениях"
-        if self.comparator.df1_df2_value is not None and not self.comparator.df1_df2_value.empty:
-            is_chunked = hasattr(self.comparator, '_truncated_df1_df2_value')
-            if is_chunked and self.comparator._truncated_df1_df2_value:
-                # info_text = f"Показаны первые {len(self.comparator.df1_df2_value)} строк (усечено из M, чанковый режим)"
-                total = getattr(self.comparator, '_total_diff', '?')
-                info_text = f"Показаны первые {len(self.comparator.df1_df2_value)} из {total} строк (чанковый режим)"   
-            else:
-                info_text = None
-            tab3 = self._create_table_widget(self.comparator.df1_df2_value, self.max_display_rows, info_text)
-            truncated = is_chunked and self.comparator._truncated_df1_df2_value
-            tab_title = f"⚠ " if truncated else ""
-            self.results_tabs.addTab(tab3, f"{tab_title}Различия ({len(self.comparator.df1_df2_value)})")
+        if diff_full is not None and not diff_full.empty:
+            tab3 = self._create_table_widget(diff_full, show_all=is_chunked)
+            tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df1_df2_value else ""
+            self.results_tabs.addTab(tab3, f"{tab_title}Различия ({total_diff})")
         else:
             tab3 = QWidget()
             tab3_layout = QVBoxLayout(tab3)
@@ -2191,34 +1974,40 @@ class MainWindow(QMainWindow):
             self.results_tabs.addTab(warning_widget, f"⚠ Предупреждения ({len(self.key_uniqueness_warnings)})")
     
 
-    def _create_table_widget(self, df: pd.DataFrame, max_display_rows: int = None, info_text_override: str = None) -> QWidget:
+    def _create_table_widget(self, df: pd.DataFrame, max_display_rows: int = None, info_text_override: str = None, show_all: bool = False) -> QWidget:
         """Создание виджета таблицы из DataFrame с подсветкой различий
         
         Args:
             df: DataFrame для отображения
             max_display_rows: лимит отображения строк (по умолчанию self.max_display_rows)
             info_text_override: если задан, заменяет автоматический info label
+            show_all: если True — показывать все строки (для чанкового режима)
         """
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
         # Применяем лимит отображения (in-memory режим)
-        # В chunked-режиме df уже усечён в compare(), поэтому head() — безопасен
+        # В chunked-режиме с show_all=True — показываем все строки
         if max_display_rows is None:
             max_display_rows = self.max_display_rows
-        total_rows = len(df)
-        display_df = df.head(max_display_rows) if len(df) > max_display_rows else df
+        
+        if show_all:
+            display_df = df
+            total_rows = len(df)
+        else:
+            total_rows = len(df)
+            display_df = df.head(max_display_rows) if len(df) > max_display_rows else df
         
         # Информация о таблице
         if info_text_override:
             info_label = QLabel(info_text_override)
-        elif total_rows > max_display_rows:
+        elif not show_all and total_rows > max_display_rows:
             info_label = QLabel(
                 f"Показаны первые {len(display_df)} из {total_rows} строк, "
                 f"Столбцов: {len(df.columns)}"
             )
         else:
-            info_label = QLabel(f"Строк: {len(df)}, Столбцов: {len(df.columns)}")
+            info_label = QLabel(f"Строк: {total_rows}, Столбцов: {len(df.columns)}")
         info_label.setStyleSheet("font-weight: bold; padding: 5px;")
         layout.addWidget(info_label)
         
@@ -2365,6 +2154,13 @@ class MainWindow(QMainWindow):
             df2_only = self.comparator.df2_only
             df1_df2_value = self.comparator.df1_df2_value
             
+            # Для чанкового режима получаем реальные total из comparator
+            # (в df1_only/df2_only/diff лежит только усечённый preview)
+            is_chunked = hasattr(self.comparator, '_total_only1')
+            total_df1_only = getattr(self.comparator, '_total_only1', len(df1_only)) if is_chunked else len(df1_only)
+            total_df2_only = getattr(self.comparator, '_total_only2', len(df2_only)) if is_chunked else len(df2_only)
+            total_diff = getattr(self.comparator, '_total_diff', len(df1_df2_value)) if is_chunked and df1_df2_value is not None else (len(df1_df2_value) if df1_df2_value is not None else 0)
+            
             # Если любой набор превышает лимит — пишем в CSV
             use_excel = (
                 (df1_only.empty or len(df1_only) <= EXCEL_ROW_LIMIT) and
@@ -2378,18 +2174,17 @@ class MainWindow(QMainWindow):
                 # Excel — для небольших наборов данных
                 with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
                     if not df1_only.empty:
-                        df1_only.to_excel(writer, sheet_name=f"Только в df1 ({len(df1_only)})", index=False)
+                        df1_only.to_excel(writer, sheet_name=f"Только в df1 ({total_df1_only})", index=False)
                         sheet_num += 1
                     
                     if not df2_only.empty:
-                        df2_only.to_excel(writer, sheet_name=f"Только в df2 ({len(df2_only)})", index=False)
+                        df2_only.to_excel(writer, sheet_name=f"Только в df2 ({total_df2_only})", index=False)
                         sheet_num += 1
                     
                     if df1_df2_value is not None and not df1_df2_value.empty:
-                        df1_df2_value.to_excel(writer, sheet_name=f"Различия ({len(df1_df2_value)})", index=False)
+                        df1_df2_value.to_excel(writer, sheet_name=f"Различия ({total_diff})", index=False)
                         sheet_num += 1
                     
-                    summary_data["Параметр"].append("Время сравнения")
                     pd.DataFrame(summary_data).to_excel(writer, sheet_name="Сводка", index=False)
                 
                 saved_path = excel_path
@@ -2460,6 +2255,13 @@ class MainWindow(QMainWindow):
                 from PySide6.QtGui import QDesktopServices
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(save_dir)))
             
+            # Очищаем временные файлы после успешного сохранения
+            if self.comparator is not None and hasattr(self.comparator, 'cleanup'):
+                try:
+                    self.comparator.cleanup()
+                except Exception:
+                    pass
+
         except Exception as e:
             QMessageBox.critical(self, "Ошибка сохранения", str(e))
             self.log(f"Ошибка сохранения: {e}", is_error=True)

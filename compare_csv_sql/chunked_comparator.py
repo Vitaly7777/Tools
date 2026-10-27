@@ -6,11 +6,13 @@ import tempfile
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 
-# Импортируем общую утилиту
+# Импортируем общие утилиты
 try:
-    from utils import sort_columns_with_suffixes
+    from utils import sort_columns_with_suffixes, auto_detect_separator, classify_columns_by_schema
 except ImportError:
     sort_columns_with_suffixes = None
+    auto_detect_separator = None
+    classify_columns_by_schema = None
 
 SEP = '\x01'
 
@@ -83,6 +85,9 @@ class ChunkedComparator:
 
     def _auto_detect_sep(self, file_path: str) -> str:
         """Автоопределение разделителя CSV файла"""
+        if auto_detect_separator:
+            return auto_detect_separator(file_path, self.encoding)
+        # Fallback на случай если utils недоступен
         try:
             with open(file_path, 'r', encoding=self.encoding) as f:
                 sample = f.read(8192)
@@ -236,16 +241,6 @@ class ChunkedComparator:
             global_current = cumulative_offset if cumulative_offset else 0
             global_total = cumulative_total if cumulative_total else 1
             self.progress_callback(0, 1, global_current, global_total, file_label)
-
-    def _count_rows(self, file_path: str) -> int:
-        """Подсчёт количества строк в CSV файле (без чтения данных)"""
-        count = 0
-        with open(file_path, 'r', encoding=self.encoding) as f:
-            # Пропускаем заголовок
-            next(f, None)
-            for _ in f:
-                count += 1
-        return max(1, count)
 
     def _count_chunks(self, file_path: str, all_cols: list) -> int:
         """Подсчёт реального количества чанков (итераций pd.read_csv)"""
@@ -425,61 +420,30 @@ class ChunkedComparator:
             # Создаём DataFrame
             df = pd.DataFrame(parsed_data)
             
-            # # Проверяем, какие неключевые столбцы числовые
-            # numeric_cols = []
-            # non_numeric_cols = []
-            
-            # for col in non_key_cols:
-            #     try:
-            #         pd.to_numeric(df[col], errors='coerce')
-            #         # Проверяем, что хотя бы 50% значений числовые
-            #         numeric_count = df[col].apply(lambda x: pd.to_numeric(x, errors='ignore') if isinstance(x, str) else x).apply(
-            #             lambda x: isinstance(x, (int, float))
-            #         ).sum()
-            #         if numeric_count > len(df) * 0.5:
-            #             numeric_cols.append(col)
-            #         else:
-            #             non_numeric_cols.append(col)
-            #     except (ValueError, TypeError):
-            #         non_numeric_cols.append(col)
-
-            numeric_cols = []
-            non_numeric_cols = []
-            
-            for col in non_key_cols:
-                if agg_func == 'first':
-                    non_numeric_cols.append(col)
-                    continue
-                
-                col_type = self.schema.get(col)
-                if col_type in ('float', 'int'):
-                    converted = pd.to_numeric(df[col], errors='coerce')
-                    if converted.notna().any():
-                        df[col] = converted.astype('float64')
-                        numeric_cols.append(col)
+            # Определяем числовые колонки ПО СХЕМЕ
+            if classify_columns_by_schema:
+                numeric_cols, non_numeric_cols = classify_columns_by_schema(
+                    non_key_cols, self.schema, agg_func
+                )
+            else:
+                # Fallback: если utils недоступен
+                numeric_cols = []
+                non_numeric_cols = []
+                for col in non_key_cols:
+                    if agg_func == 'first':
+                        non_numeric_cols.append(col)
                         continue
-                    self._log(
-                        f"  ⚠️ {table}: колонка '{col}' помечена как {col_type}, "
-                        f"но не содержит числовых значений — будет 'first'"
-                    )
-                non_numeric_cols.append(col)
+                    col_type = self.schema.get(col)
+                    if col_type in ('float', 'int'):
+                        numeric_cols.append(col)
+                    else:
+                        non_numeric_cols.append(col)
             
             if numeric_cols:
                 self._log(f"  Числовые столбцы (агрегируются): {', '.join(numeric_cols)}")
             if non_numeric_cols:
                 self._log(f"  Строковые столбцы (первое значение): {', '.join(non_numeric_cols)}")
             
-            # # Строим словарь агрегации
-            # agg_dict = {}
-            # for col in numeric_cols:
-            #     if agg_func == 'first':
-            #         agg_dict[col] = 'first'
-            #     else:
-            #         agg_dict[col] = agg_func
-            
-            # for col in non_numeric_cols:
-            #     agg_dict[col] = 'first'
-
             agg_dict = {col: agg_func for col in numeric_cols}
             for col in non_numeric_cols:
                 agg_dict[col] = 'first'
@@ -508,7 +472,6 @@ class ChunkedComparator:
             data_to_insert = []
             for _, row in df_agg.iterrows():
                 key_values = [str(row[col]) for col in self.key_columns]
-                # row_values = [str(row[col]) for col in all_cols]
                 
                 row_values = [
                     _fmt_number(row[col], self.schema.get(col))
@@ -642,23 +605,10 @@ class ChunkedComparator:
             row1_split.columns = all_cols
             row2_split.columns = all_cols
 
-            # # Фильтр по tolerance
-            # if self.tolerance == 0:
-            #     mask = pd.Series([True] * len(row1_split))
-            # else:
-            #     mask = pd.Series([True] * len(row1_split))
-            #     for col in non_key_cols:
-            #         if self.schema.get(col) == 'float':
-            #             diff_abs = (pd.to_numeric(row1_split[col], errors='coerce') -
-            #                         pd.to_numeric(row2_split[col], errors='coerce')).abs()
-            #             mask &= (diff_abs > self.tolerance)
-            #         elif self.schema.get(col) == 'string':
-            #             mask &= (row1_split[col] != row2_split[col])
-
             # Фильтр по tolerance: строка остаётся в отчёте,
             # если ХОТЯ БЫ ОДИН неключевой столбец вне допуска.
             # Ранее использовался AND — ошибочно оставляло только строки,
-            # где ВСЕ столбцы различаются одновременно.
+            # где ВСЕ столбцы различались одновременно.
             mask = pd.Series(False, index=row1_split.index)
             for col in non_key_cols:
                 if self.schema.get(col) == 'float':

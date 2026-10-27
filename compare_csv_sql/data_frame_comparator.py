@@ -9,9 +9,10 @@ except ImportError:
 
 # Импортируем общие утилиты
 try:
-    from utils import sort_columns_with_suffixes
+    from utils import sort_columns_with_suffixes, classify_columns_by_schema
 except ImportError:
     sort_columns_with_suffixes = None
+    classify_columns_by_schema = None
 
 
 class InMemoryComparator:
@@ -63,6 +64,11 @@ class InMemoryComparator:
         """Отправка сообщения в лог"""
         if self.log_callback:
             self.log_callback(message)
+
+    def _log_error(self, message: str):
+        """Отправка сообщения об ошибке в лог"""
+        if self.log_callback:
+            self.log_callback(message, is_error=True)
 
     def validate_schema(self) -> bool:
         """Проверка соответствия схемы данных для обоих датафреймов"""
@@ -149,71 +155,32 @@ class InMemoryComparator:
                 self._log(f"  {df_name}: таблица пуста, пропуск")
                 continue
             
-            # # Проверяем, какие неключевые столбцы числовые
-            # numeric_cols = []
-            # non_numeric_cols = []
-            
-            # for col in non_key_cols:
-            #     try:
-            #         pd.to_numeric(df[col], errors='coerce')
-            #         # Проверяем, что хотя бы 50% значений числовые
-            #         numeric_count = df[col].apply(lambda x: pd.to_numeric(x, errors='ignore') if isinstance(x, str) else x).apply(
-            #             lambda x: isinstance(x, (int, float))
-            #         ).sum()
-            #         if numeric_count > rows_before * 0.5:
-            #             numeric_cols.append(col)
-            #         else:
-            #             non_numeric_cols.append(col)
-            #     except (ValueError, TypeError):
-            #         non_numeric_cols.append(col)
-
             # Определяем числовые колонки ПО СХЕМЕ, а не по значениям.
-            # Причины: (1) детерминизм, (2) согласованность с read_csv_with_schema_v1,
+            # Причины: (1) детерминизм, (2) согласованность с chunked режимом,
             # (3) одинаковое поведение для df1 и df2.
-            #
-            # Для agg_func='first' числовая агрегация не нужна — все колонки идут 'first',
-            # причём 'first' должен вернуть ОРИГИНАЛЬНОЕ (строковое) значение,
-            # а не результат пересчёта через float — поэтому конверсию пропускаем.
-            numeric_cols = []
-            non_numeric_cols = []
-            
-            for col in non_key_cols:
-                if agg_func == 'first':
-                    non_numeric_cols.append(col)
-                    continue
-                
-                col_type = self.schema.get(col)
-                if col_type in ('float', 'int'):
-                    converted = pd.to_numeric(df[col], errors='coerce')
-                    if converted.notna().any():
-                        # .astype('float64') гарантирует одинаковый dtype
-                        # в df1 и df2 — иначе merge/is_numeric_dtype могут
-                        # разойтись (например, Int64 vs float64).
-                        df[col] = converted.astype('float64')
-                        numeric_cols.append(col)
+            if classify_columns_by_schema:
+                numeric_cols, non_numeric_cols = classify_columns_by_schema(
+                    non_key_cols, self.schema, agg_func
+                )
+            else:
+                # Fallback: если utils недоступен
+                numeric_cols = []
+                non_numeric_cols = []
+                for col in non_key_cols:
+                    if agg_func == 'first':
+                        non_numeric_cols.append(col)
                         continue
-                    self._log(
-                        f"  ⚠️ {df_name}: колонка '{col}' помечена как {col_type}, "
-                        f"но не содержит числовых значений — будет 'first'"
-                    )
-                non_numeric_cols.append(col)
+                    col_type = self.schema.get(col)
+                    if col_type in ('float', 'int'):
+                        numeric_cols.append(col)
+                    else:
+                        non_numeric_cols.append(col)
             
             if numeric_cols:
                 self._log(f"  Числовые столбцы (агрегируются): {', '.join(numeric_cols)}")
             if non_numeric_cols:
                 self._log(f"  Строковые столбцы (первое значение): {', '.join(non_numeric_cols)}")
             
-            # # Строим словарь агрегации
-            # agg_dict = {}
-            # for col in numeric_cols:
-            #     if agg_func == 'first':
-            #         agg_dict[col] = 'first'
-            #     else:
-            #         agg_dict[col] = agg_func
-            
-            # for col in non_numeric_cols:
-            #     agg_dict[col] = 'first'
-
             # Строим словарь агрегации: числовые — по agg_func, остальные — 'first'
             agg_dict = {col: agg_func for col in numeric_cols}
             for col in non_numeric_cols:
@@ -254,76 +221,23 @@ class InMemoryComparator:
         self.validate_schema()
         self.sort_dataframes()
 
-        # # Оптимизация: apply(tuple) вместо iterrows() — в 2-3x быстрее
-        # df1_dict = dict(
-        #     zip(
-        #         self.df1[self.key_columns].apply(tuple, axis=1),
-        #         self.df1.index
-        #     )
-        # )
-        # df2_dict = dict(
-        #     zip(
-        #         self.df2[self.key_columns].apply(tuple, axis=1),
-        #         self.df2.index
-        #     )
-        # )
-
-        # df1_only_indices = []
-        # df2_only_indices = []
-        # df1_df2_value_data = []
-        # non_key_columns = self._get_non_key_columns()
-
-        # for key, idx1 in df1_dict.items():
-        #     if key not in df2_dict:
-        #         df1_only_indices.append(idx1)
-        #     else:
-        #         idx2 = df2_dict[key]
-        #         row1 = self.df1.iloc[idx1]
-        #         row2 = self.df2.iloc[idx2]
-        #         has_diff = False
-        #         diff_data = {col: row1[col] for col in self.key_columns}
-        #         for col in non_key_columns:
-        #             if not self._values_equal(row1[col], row2[col]):
-        #                 has_diff = True
-        #                 diff_data[f"{col}_df1"] = row1[col]
-        #                 diff_data[f"{col}_df2"] = row2[col]
-        #             else:
-        #                 diff_data[f"{col}_df1"] = row1[col]
-        #                 diff_data[f"{col}_df2"] = row2[col]
-        #         if has_diff:
-        #             df1_df2_value_data.append(diff_data)
-
-        # for key, idx2 in df2_dict.items():
-        #     if key not in df1_dict:
-        #         df2_only_indices.append(idx2)
-
-        # self.df1_only = self.df1.iloc[df1_only_indices].reset_index(drop=True) \
-        #     if df1_only_indices else pd.DataFrame(columns=self.df1.columns)
-        # self.df2_only = self.df2.iloc[df2_only_indices].reset_index(drop=True) \
-        #     if df2_only_indices else pd.DataFrame(columns=self.df2.columns)
-
-        # if df1_df2_value_data:
-        #     self.df1_df2_value = pd.DataFrame(df1_df2_value_data)
-        #     self.df1_df2_value = self._sort_columns_with_suffixes(self.df1_df2_value)
-        # else:
-            # self.df1_df2_value = None
-
         non_key_columns = self._get_non_key_columns()
 
-        # КРИТИЧНО: дубликаты ключей ломают и dict-подход (оставляет последний),
-        # и merge (размножает строки). Явно проверяем и падаем с понятной ошибкой.
-        if self.df1.duplicated(subset=self.key_columns, keep=False).any():
-            raise ValueError(
-                f"В df1 обнаружены неуникальные ключи по {self.key_columns}. "
-                "Сравнение невозможно — включите агрегацию дубликатов "
-                "или проверьте входные данные."
-            )
-        if self.df2.duplicated(subset=self.key_columns, keep=False).any():
-            raise ValueError(
-                f"В df2 обнаружены неуникальные ключи по {self.key_columns}. "
-                "Сравнение невозможно — включите агрегацию дубликатов "
-                "или проверьте входные данные."
-            )
+        # Обработка дубликатов: если агрегация не включена — оставляем первую строку
+        # и предупреждаем пользователя.
+        # check_uniqueness() уже вызван заранее в main.py.
+        for df_name, df in [('df1', self.df1), ('df2', self.df2)]:
+            dup_mask = df.duplicated(subset=self.key_columns, keep='first')
+            if dup_mask.any():
+                dup_count = int(dup_mask.sum())
+                self._log(
+                    f"  ⚠️ {df_name}: {dup_count} строк с дублирующимися ключами "
+                    f"(оставлена первая строка из каждой группы)"
+                )
+                if df_name == 'df1':
+                    self.df1 = df[~dup_mask].reset_index(drop=True)
+                else:
+                    self.df2 = df[~dup_mask].reset_index(drop=True)
 
         merged = self.df1.merge(
             self.df2,
@@ -405,19 +319,54 @@ class InMemoryComparator:
                 sorted_other_cols.append(df2_col)
         return df[key_cols + sorted_other_cols]
 
-    def print_results(self) -> None:
-        if (self.df1_only.empty and self.df2_only.empty and self.df1_df2_value is None):
-            print("Нет отличий")
-        else:
-            if not self.df1_only.empty:
-                print("\n=== Строки только в df1 (df1_only) ===")
-                print(self.df1_only)
-            if not self.df2_only.empty:
-                print("\n=== Строки только в df2 (df2_only) ===")
-                print(self.df2_only)
-            if self.df1_df2_value is not None and not self.df1_df2_value.empty:
-                print("\n=== Различия в значениях (df1_df2_value) ===")
-                print(self.df1_df2_value)
+    def check_uniqueness(self) -> Tuple[Dict[str, Dict], List[Tuple]]:
+        """
+        Проверка уникальности ключей.
+        
+        Returns:
+            (results, dup_samples) — results: {table: {unique: bool, dup_keys: int, dup_rows: int}}
+            dup_samples: список кортежей (table_name, sample_df) для показа в UI
+        """
+        SEP = '\x01'
+        results = {}
+        dup_samples = []
+        
+        for df_name, df in [('df1', self.df1), ('df2', self.df2)]:
+            if not self.key_columns or df.empty:
+                results[df_name] = {'unique': True, 'dup_keys': 0, 'dup_rows': 0}
+                continue
+            
+            # Создаём составной ключ (аналог key_json в ChunkedComparator)
+            df_temp = df.copy()
+            df_temp['_composite_key'] = df_temp[self.key_columns].astype(str).agg(SEP.join, axis=1)
+            
+            # Находим дублирующиеся ключи
+            key_counts = df_temp['_composite_key'].value_counts()
+            dup_keys = key_counts[key_counts > 1]
+            
+            if len(dup_keys) == 0:
+                results[df_name] = {'unique': True, 'dup_keys': 0, 'dup_rows': 0}
+                self._log(f"  ✓ {df_name}: ключи уникальны")
+            else:
+                dup_keys_count = len(dup_keys)
+                dup_rows_count = int(dup_keys.sum())
+                
+                results[df_name] = {'unique': False, 'dup_keys': dup_keys_count, 'dup_rows': dup_rows_count}
+                self._log_error(f"  ⚠️ {df_name}: обнаружено {dup_keys_count} неуникальных ключей ({dup_rows_count} строк)")
+                
+                # Получаем примеры дублирующихся строк (до 20)
+                dup_mask = df_temp['_composite_key'].isin(dup_keys.index)
+                sample_data = df_temp[dup_mask].head(20)
+                
+                if not sample_data.empty:
+                    sample_dfs = []
+                    for _, row in sample_data.iterrows():
+                        row_dict = {col: row[col] for col in self.key_columns}
+                        sample_dfs.append(row_dict)
+                    sample_df = pd.DataFrame(sample_dfs)
+                    dup_samples.append((df_name, sample_df))
+        
+        return results, dup_samples
 
 
 # -------------------------------------------
@@ -444,18 +393,6 @@ def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
     Возвращает:
         Объект с методами compare() и атрибутами df1_only, df2_only, df1_df2_value.
     """
-    # if use_chunked and df1_path and df2_path and ChunkedComparator is not None:
-    #     return ChunkedComparator(
-    #         df1_path, df2_path,
-    #         key_columns, schema, tolerance,
-    #         chunksize=chunksize,
-    #         db_path=db_path,
-    #         encoding=encoding,
-    #         sep=separator
-    #     )
-    # else:
-    #     return InMemoryComparator(df1, df2, tolerance, schema, key_columns)
-
     if use_chunked:
         if ChunkedComparator is None:
             raise RuntimeError(

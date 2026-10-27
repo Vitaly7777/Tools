@@ -4,7 +4,7 @@
 для устранения дублирования кода.
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 
 def sort_columns_with_suffixes(df, key_columns: List[str], schema: Dict[str, str] = None):
@@ -131,4 +131,76 @@ def parse_key_columns(text: str) -> List[str]:
     if not text or not text.strip():
         return []
     return [col.strip() for col in text.split(",")]
+
+
+def auto_detect_separator(file_path: str, encoding: str = 'utf-8') -> str:
+    """
+    Автоопределение разделителя CSV файла по частоте встречаемости.
+    
+    Анализирует первые 8192 байта файла, считает количество
+    запятых, точек с запятой, табуляций и вертикальных табов.
+    Возвращает разделитель с максимальной частотой, если он
+    встречается >= 3 раз. Иначе — ',' (по умолчанию).
+    
+    Args:
+        file_path: Путь к CSV файлу
+        encoding: Кодировка файла (по умолчанию utf-8)
+    
+    Returns:
+        Обнаруженный разделитель (',', ';', '\\t', '|') или ','
+    """
+    try:
+        with open(file_path, 'r', encoding=encoding) as f:
+            sample = f.read(8192)
+        candidates = {
+            ',': sample.count(','),
+            ';': sample.count(';'),
+            '\t': sample.count('\t'),
+            '|': sample.count('|')
+        }
+        best_sep = max(candidates, key=candidates.get)
+        if candidates[best_sep] >= 3:
+            return best_sep
+    except Exception:
+        pass
+    return ','
+
+
+def classify_columns_by_schema(
+    non_key_cols: List[str],
+    schema: Dict[str, str],
+    agg_func: str = 'sum'
+) -> Tuple[List[str], List[str]]:
+    """
+    Разделяет столбцы на числовые и строковые на основе схемы.
+    
+    Использует схему (schema), а не инференцию из данных — детерминировано
+    и одинаково для обоих режимов (InMemory и Chunked).
+    
+    Для agg_func='first' все столбцы идут в non_numeric (не нужна
+    числовая агрегация, 'first' вернёт оригинальное значение).
+    
+    Args:
+        non_key_cols: Список неключевых столбцов
+        schema: Словарь схемы {column_name: column_type}
+        agg_func: Функция агрегации ('sum', 'mean', 'min', 'max', 'first')
+    
+    Returns:
+        (numeric_cols, non_numeric_cols) — два списка столбцов
+    """
+    numeric_cols = []
+    non_numeric_cols = []
+    
+    for col in non_key_cols:
+        if agg_func == 'first':
+            non_numeric_cols.append(col)
+            continue
+        
+        col_type = schema.get(col)
+        if col_type in ('float', 'int'):
+            numeric_cols.append(col)
+        else:
+            non_numeric_cols.append(col)
+    
+    return numeric_cols, non_numeric_cols
 
