@@ -539,27 +539,51 @@ class CompareWorker(QThread):
                 self.progress.emit("Загрузка данных в БД (чанками)...")
                 comparator.load_data()
 
-            # Автоматическая проверка уникальности ключей (для обоих режимов)
+            # Проверка уникальности ключей
             self.progress.emit("Проверка уникальности ключей...")
-            try:
-                uniqueness_results, dup_samples = comparator.check_uniqueness()
-                
-                for table_name, result in uniqueness_results.items():
-                    if not result['unique']:
-                        # Отправляем предупреждение в UI
-                        msg = f"Обнаружены неуникальные ключи в {table_name}: {result['dup_keys']} ключей ({result['dup_rows']} строк)"
-                        self.key_uniqueness_warning.emit(msg, "")
-                        
-                        # Показываем примеры дубликатов через сигнал
-                        for sample_table, sample_df in dup_samples:
-                            if sample_table == table_name and not sample_df.empty:
-                                self.duplicates_found.emit(table_name, sample_df)
-            except Exception as e:
-                self.log_callback(f"  ⚠️ Ошибка проверки уникальности: {e}")
-                # Продолжаем сравнение даже при ошибке проверки
+            
+            # Для in-memory режима с агрегацией — проверяем уникальность ПОСЛЕ агрегации
+            # (агрегация выполняется внутри compare())
+            if not self.use_chunked and self.agg_func:
+                try:
+                    self.progress.emit("Выполнение сравнения (включая агрегацию)...")
+                    comparator.compare()
+                    
+                    # После агрегации проверяем уникальность на отагрегированных данных
+                    uniqueness_results, dup_samples = comparator.check_uniqueness()
+                    
+                    for table_name, result in uniqueness_results.items():
+                        if not result['unique']:
+                            msg = f"Обнаружены неуникальные ключи в {table_name}: {result['dup_keys']} ключей ({result['dup_rows']} строк)"
+                            self.key_uniqueness_warning.emit(msg, "")
+                            
+                            for sample_table, sample_df in dup_samples:
+                                if sample_table == table_name and not sample_df.empty:
+                                    self.duplicates_found.emit(table_name, sample_df)
+                except Exception as e:
+                    self.log_callback(f"  ⚠️ Ошибка сравнения/проверки уникальности: {e}")
+                    raise
+            else:
+                # Без агрегации (или чанковый режим) — проверяем до сравнения
+                try:
+                    uniqueness_results, dup_samples = comparator.check_uniqueness()
+                    
+                    for table_name, result in uniqueness_results.items():
+                        if not result['unique']:
+                            msg = f"Обнаружены неуникальные ключи в {table_name}: {result['dup_keys']} ключей ({result['dup_rows']} строк)"
+                            self.key_uniqueness_warning.emit(msg, "")
+                            
+                            for sample_table, sample_df in dup_samples:
+                                if sample_table == table_name and not sample_df.empty:
+                                    self.duplicates_found.emit(table_name, sample_df)
+                except Exception as e:
+                    self.log_callback(f"  ⚠️ Ошибка проверки уникальности: {e}")
 
             self.progress.emit("Выполнение сравнения...")
-            if self.use_chunked:
+            if not self.use_chunked and self.agg_func:
+                # Уже выполнено выше
+                pass
+            elif self.use_chunked:
                 comparator.compare()
             else:
                 comparator.compare()
@@ -668,6 +692,7 @@ class MainWindow(QMainWindow):
         top_layout = QVBoxLayout(top_panel)
 
         file_panel = self._create_file_panel()
+        file_panel.setMaximumHeight(250)  # Фиксированная высота панели файлов
         top_layout.addWidget(file_panel)
 
         settings_panel = self._create_settings_panel()
@@ -688,6 +713,15 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.results_tabs)
 
         main_layout.addWidget(splitter)
+        
+        # Фиксируем размеры splitter'а: верхняя часть не должна менять размер
+        # 0 = верхняя панель (log_panel), 1 = нижняя панель (results_tabs)
+        splitter.setSizes([150, 10000])
+        splitter.setStretchFactor(0, 0)  # log_panel не растягивается
+        splitter.setStretchFactor(1, 1)  # results_tabs занимает всё остальное
+        
+        # Фиксируем размеры верхней панели
+        top_panel.setMaximumHeight(400)  # Максимальная высота верхней панели
 
         self.status_bar = self.statusBar()
         self.progress_bar = QProgressBar()
@@ -702,26 +736,14 @@ class MainWindow(QMainWindow):
 
     def _setup_shortcuts(self):
         """Настройка горячих клавиш"""
-        # Ctrl+O — открыть файл 1
-        open_action = QAction("Ctrl+O", self)
-        open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(lambda: self._select_file(1))
-        self.addAction(open_action)
-        
-        # Ctrl+Shift+O — открыть файл 2
-        open_action2 = QAction("Ctrl+Shift+O", self)
-        open_action2.setShortcut("Ctrl+Shift+O")
-        open_action2.triggered.connect(lambda: self._select_file(2))
-        self.addAction(open_action2)
-        
         # Ctrl+S — сохранить результаты
-        save_action = QAction("Ctrl+S", self)
+        save_action = QAction(self)
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(self._save_results)
         self.addAction(save_action)
         
         # Ctrl+R — запустить сравнение
-        compare_action = QAction("Ctrl+R", self)
+        compare_action = QAction(self)
         compare_action.setShortcut("Ctrl+R")
         compare_action.triggered.connect(self._start_comparison)
         self.addAction(compare_action)
@@ -732,6 +754,22 @@ class MainWindow(QMainWindow):
         
         # Меню Файл
         file_menu = menubar.addMenu("Файл")
+        
+        # Выбор файла 1 (эталон)
+        select_file1_action = QAction("Выбрать файл 1 (эталон)...", self)
+        select_file1_action.setShortcut("Ctrl+O")
+        select_file1_action.triggered.connect(lambda: self._select_file(1))
+        file_menu.addAction(select_file1_action)
+        self.addAction(select_file1_action)  # Добавляем в окно для горячих клавиш
+        
+        # Выбор файла 2 (сравнение)
+        select_file2_action = QAction("Выбрать файл 2 (сравнение)...", self)
+        select_file2_action.setShortcut("Ctrl+Shift+O")
+        select_file2_action.triggered.connect(lambda: self._select_file(2))
+        file_menu.addAction(select_file2_action)
+        self.addAction(select_file2_action)  # Добавляем в окно для горячих клавиш
+        
+        file_menu.addSeparator()
         
         # Выбор каталога для результатов
         set_output_dir_action = QAction("Выбрать каталог для результатов...", self)
@@ -1012,20 +1050,24 @@ class MainWindow(QMainWindow):
         control_buttons = QVBoxLayout()
         btn_load = QPushButton("1. Загрузить файлы")
         btn_load.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        btn_load.setMaximumWidth(200)
         btn_load.clicked.connect(self._load_files)
         control_buttons.addWidget(btn_load)
 
         self.btn_compare = QPushButton("2. Сравнить!")
         self.btn_compare.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; font-size: 14px;")
+        self.btn_compare.setMaximumWidth(200)
         self.btn_compare.clicked.connect(self._start_comparison)
         control_buttons.addWidget(self.btn_compare)
 
         self.btn_save = QPushButton("3. Сохранить результаты")
         self.btn_save.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self.btn_save.setMaximumWidth(200)
         self.btn_save.clicked.connect(self._save_results)
         control_buttons.addWidget(self.btn_save)
 
         btn_clear = QPushButton("Очистить все")
+        btn_clear.setMaximumWidth(200)
         btn_clear.clicked.connect(self._clear_all)
         control_buttons.addWidget(btn_clear)
 
@@ -1179,7 +1221,6 @@ class MainWindow(QMainWindow):
 
     def _check_key_uniqueness_manual(self):
         """Ручная проверка уникальности ключей"""
-        self.log("Начата проверка уникальности ключей...")
         QApplication.processEvents()  # Обновляем UI перед длительной операцией
         
         key_columns = self._get_key_columns_from_table()
@@ -1219,11 +1260,6 @@ class MainWindow(QMainWindow):
                 for sample_table, sample_df in dup_samples:
                     if sample_table == table_name and not sample_df.empty:
                         self._show_duplicates_table(sample_df, f"Дубликаты в {table_name}")
-            else:
-                self.log(f"✓ Ключи в {table_name} уникальны")
-        
-        if not has_warnings:
-            QMessageBox.information(self, "Уникальность ключей", "Ключи уникальны в обоих датафреймах!")
 
     def _check_uniqueness_chunked(self, key_columns: List[str]):
         """Проверка уникальности ключей напрямую из CSV-файлов через SQLite (чанки)"""
@@ -1245,6 +1281,9 @@ class MainWindow(QMainWindow):
         if self.sep_auto_checkbox.isChecked():
             sep = self._auto_detect_separator(path1) or ","
         
+        self.log("Загрузка файлов для проверки уникальности...")
+        QApplication.processEvents()
+        
         # Создаём временный comparator для проверки уникальности
         from data_frame_comparator import create_comparator
         comparator = create_comparator(
@@ -1255,11 +1294,23 @@ class MainWindow(QMainWindow):
             df1_path=path1,
             df2_path=path2,
             separator=sep,
-            log_callback=lambda m, is_error=False: self.log(m, is_error=is_error)
+            log_callback=lambda m, is_error=False: self.log(m, is_error=is_error),
+            progress_callback=lambda fc, ft, gc, gt, fl: self._on_progress_chunk(fc, ft, gc, gt, fl)
         )
         try:
-            # Загружаем только ключевые столбцы (минимальная нагрузка)
-            comparator.load_data()
+            # Загружаем файлы чанками с прогрессом
+            self.log("  Загрузка файла 1...")
+            QApplication.processEvents()
+            comparator._load_file(path1, 'df1', file_label='Файл 1',
+                                  file_total_chunks=comparator._count_chunks(path1, list(self.current_schema.keys())),
+                                  cumulative_offset=0, cumulative_total=comparator._count_chunks(path1, list(self.current_schema.keys())) + comparator._count_chunks(path2, list(self.current_schema.keys())))
+            
+            self.log("  Загрузка файла 2...")
+            QApplication.processEvents()
+            comparator._load_file(path2, 'df2', file_label='Файл 2',
+                                  file_total_chunks=comparator._count_chunks(path2, list(self.current_schema.keys())),
+                                  cumulative_offset=comparator._count_chunks(path1, list(self.current_schema.keys())),
+                                  cumulative_total=comparator._count_chunks(path1, list(self.current_schema.keys())) + comparator._count_chunks(path2, list(self.current_schema.keys())))
             
             # Проверяем уникальность
             results, dup_samples = comparator.check_uniqueness()
@@ -1272,13 +1323,11 @@ class MainWindow(QMainWindow):
                     for sample_table, sample_df in dup_samples:
                         if sample_table == table_name and not sample_df.empty:
                             self._show_duplicates_table(sample_df, f"Дубликаты в {table_name}")
-                else:
-                    self.log(f"✓ Ключи в {table_name} уникальны")
             
-            if not has_warnings:
-                QMessageBox.information(self, "Уникальность ключей", "Ключи уникальны в обоих файлах!")
-            else:
+            if has_warnings:
                 QMessageBox.information(self, "Уникальность ключей", "Проверка завершена. Результаты в логе.")
+            else:
+                QMessageBox.information(self, "Уникальность ключей", "Ключи уникальны в обоих файлах!")
         finally:
             comparator.close()
 
@@ -1817,6 +1866,14 @@ class MainWindow(QMainWindow):
         if global_total > 0:
             global_percent = int(global_current / global_total * 100)
             self.progress_bar.setValue(global_percent)
+    
+    def _on_progress_chunk(self, file_current: int, file_total: int,
+                           global_current: int, global_total: int, file_label: str):
+        """Обработка прогресса чанковой загрузки (для ручной проверки уникальности)"""
+        if file_total > 0:
+            file_percent = int(file_current / file_total * 100)
+            self.log(f"  {file_label}: {file_current}/{file_total} чанков ({file_percent}%)")
+            QApplication.processEvents()
 
     def _on_key_uniqueness_warning(self, message: str, details: str):
         """Обработка предупреждения о неуникальных ключах (неблокирующая)"""
@@ -1932,7 +1989,7 @@ class MainWindow(QMainWindow):
         
         # Таблица "Только в df1"
         if not df1_only_full.empty:
-            tab1 = self._create_table_widget(df1_only_full, show_all=is_chunked)
+            tab1 = self._create_table_widget(df1_only_full, show_all=False)
             tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df1_only else ""
             self.results_tabs.addTab(tab1, f"{tab_title}Только в df1 ({total_df1_only})")
         else:
@@ -1943,7 +2000,7 @@ class MainWindow(QMainWindow):
         
         # Таблица "Только в df2"
         if not df2_only_full.empty:
-            tab2 = self._create_table_widget(df2_only_full, show_all=is_chunked)
+            tab2 = self._create_table_widget(df2_only_full, show_all=False)
             tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df2_only else ""
             self.results_tabs.addTab(tab2, f"{tab_title}Только в df2 ({total_df2_only})")
         else:
@@ -1954,7 +2011,11 @@ class MainWindow(QMainWindow):
         
         # Таблица "Различия в значениях"
         if diff_full is not None and not diff_full.empty:
-            tab3 = self._create_table_widget(diff_full, show_all=is_chunked)
+            if is_chunked:
+                # В чанковом режиме: все данные, но видно только 3 строки, остальное скроллом
+                tab3 = self._create_table_widget(diff_full, show_all=True, max_visible_rows=3)
+            else:
+                tab3 = self._create_table_widget(diff_full, show_all=False)
             tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df1_df2_value else ""
             self.results_tabs.addTab(tab3, f"{tab_title}Различия ({total_diff})")
         else:
@@ -2022,7 +2083,7 @@ class MainWindow(QMainWindow):
             self.results_tabs.addTab(warning_widget, f"⚠ Предупреждения ({len(self.key_uniqueness_warnings)})")
     
 
-    def _create_table_widget(self, df: pd.DataFrame, max_display_rows: int = None, info_text_override: str = None, show_all: bool = False) -> QWidget:
+    def _create_table_widget(self, df: pd.DataFrame, max_display_rows: int = None, info_text_override: str = None, show_all: bool = False, max_visible_rows: int = None) -> QWidget:
         """Создание виджета таблицы из DataFrame с подсветкой различий
         
         Args:
@@ -2030,6 +2091,7 @@ class MainWindow(QMainWindow):
             max_display_rows: лимит отображения строк (по умолчанию self.max_display_rows)
             info_text_override: если задан, заменяет автоматический info label
             show_all: если True — показывать все строки (для чанкового режима)
+            max_visible_rows: если задан, ограничивает видимую высоту таблицы (остальное скроллом)
         """
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -2065,12 +2127,17 @@ class MainWindow(QMainWindow):
         table.setHorizontalHeaderLabels(display_df.columns.tolist())
         table.setRowCount(len(display_df))
         
-        # Ограничиваем размер таблицы чтобы не ломать layout при большом количестве строк
-        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        max_table_height = min(len(display_df) * 30 + 50, 600)
-        table.setMaximumHeight(max_table_height)
-        table.setMinimumHeight(max_table_height)
-        table.resize(table.width(), max_table_height)
+        # Ограничиваем размер таблицы
+        if max_visible_rows is not None:
+            # Ограничиваем видимую часть указанным количеством строк
+            table_height = min(max_visible_rows * 30 + 50, 600)
+        else:
+            table_height = min(len(display_df) * 30 + 50, 600)
+        
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table.setMaximumHeight(table_height)
+        table.setMinimumHeight(table_height)
+        table.resize(table.width(), table_height)
         table.updateGeometry()
         QApplication.processEvents()
         
@@ -2304,7 +2371,7 @@ class MainWindow(QMainWindow):
             reply = QMessageBox.information(
                 self, "Сохранение",
                 msg + "\n\nОткрыть папку?",
-                QMessageBox.Ok | QMessageBox.Open
+                QMessageBox.No | QMessageBox.Open
             )
             
             if reply == QMessageBox.Open:

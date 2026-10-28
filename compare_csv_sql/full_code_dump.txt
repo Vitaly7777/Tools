@@ -1,0 +1,4456 @@
+===== FILE: ./chunked_comparator.py =====
+import sqlite3
+import hashlib
+import pandas as pd
+import os
+import tempfile
+from typing import List, Dict, Tuple, Optional
+from pathlib import Path
+
+# Импортируем общие утилиты
+try:
+    from utils import sort_columns_with_suffixes, auto_detect_separator, classify_columns_by_schema
+except ImportError:
+    sort_columns_with_suffixes = None
+    auto_detect_separator = None
+    classify_columns_by_schema = None
+
+SEP = '\x01'
+
+
+class ChunkedComparator:
+    def __init__(self, df1_path: str, df2_path: str,
+                 key_columns: List[str],
+                 schema: Dict[str, str],
+                 tolerance: float = 0.0,
+                 chunksize: int = 50000,
+                 db_path: Optional[str] = None,
+                 encoding: str = 'utf-8',
+                 insert_batch_size: int = 500,
+                 sep: str = ',',
+                 max_display_rows: int = 10000,
+                 agg_func: str = None,
+                 log_callback=None,
+                 progress_callback=None):
+        self.df1_path = df1_path
+        self.df2_path = df2_path
+        self.key_columns = key_columns
+        self.schema = schema
+        self.tolerance = tolerance
+        self.chunksize = chunksize
+        self.db_path = db_path or ":memory:"
+        self.encoding = encoding
+        self.insert_batch_size = insert_batch_size
+        self.sep = sep
+        self.max_display_rows = max_display_rows
+        self.agg_func = agg_func  # функция агрегации ('sum', 'mean', 'min', 'max') или None
+        self.log_callback = log_callback  # callback для логирования
+        self.progress_callback = progress_callback  # callback для прогресса загрузки (current_chunk, total_chunks)
+        self.conn = None
+        self.df1_only = pd.DataFrame()
+        self.df2_only = pd.DataFrame()
+        self.df1_df2_value = None
+        # Флаги усечения (показаны ли не все строки)
+        self._truncated_df1_only = False
+        self._truncated_df2_only = False
+        self._truncated_df1_df2_value = False
+        self._temp_dir = None
+        self._saved_files = []
+        self._init_db()
+
+    def _init_db(self):
+        self.conn = sqlite3.connect(self.db_path)
+        
+        # Оптимизации для быстрой вставки миллионов строк
+        self.conn.execute('PRAGMA synchronous=OFF')
+        self.conn.execute('PRAGMA journal_mode=MEMORY')
+        self.conn.execute('PRAGMA temp_store=MEMORY')
+        
+        # Без AUTOINCREMENT и индексов — вставка в 5-10x быстрее
+        # key_hash используется для JOIN, индекс не нужен (JOIN по хешу быстрый)
+        self.conn.execute('''
+            CREATE TABLE df1 (
+                key_hash TEXT,
+                key_json TEXT,
+                row_json TEXT
+            )
+        ''')
+        self.conn.execute('''
+            CREATE TABLE df2 (
+                key_hash TEXT,
+                key_json TEXT,
+                row_json TEXT
+            )
+        ''')
+        self.conn.commit()
+
+    def _auto_detect_sep(self, file_path: str) -> str:
+        """Автоопределение разделителя CSV файла"""
+        if auto_detect_separator:
+            return auto_detect_separator(file_path, self.encoding)
+        # Fallback на случай если utils недоступен
+        try:
+            with open(file_path, 'r', encoding=self.encoding) as f:
+                sample = f.read(8192)
+            candidates = {
+                ',': sample.count(','),
+                ';': sample.count(';'),
+                '\t': sample.count('\t'),
+                '|': sample.count('|')
+            }
+            best_sep = max(candidates, key=candidates.get)
+            if candidates[best_sep] >= 3:
+                return best_sep
+        except Exception:
+            pass
+        return ','
+
+    def _validate_columns(self, file_path: str, table_name: str):
+        """Проверка что все столбцы из схемы есть в CSV-файле"""
+        all_cols = list(self.schema.keys())
+        
+        # Автоопределение разделителя перед чтением заголовков
+        detected_sep = self._auto_detect_sep(file_path)
+        
+        # Читаем только заголовки с определённым разделителем
+        try:
+            df_temp = pd.read_csv(file_path, nrows=0, encoding=self.encoding, sep=detected_sep)
+            file_columns = set(df_temp.columns)
+        except Exception as e:
+            raise FileNotFoundError(f"Не удалось прочитать заголовки {file_path}: {e}")
+        
+        missing_cols = [col for col in all_cols if col not in file_columns]
+        if missing_cols:
+            available = ', '.join(list(file_columns)[:10])
+            if len(file_columns) > 10:
+                available += '...'
+            raise ValueError(
+                f"В файле {table_name} ({file_path}) не найдены столбцы схемы:\n"
+                f"  Отсутствуют: {', '.join(missing_cols)}\n"
+                f"  Доступные: {available}\n"
+                f"  Разделитель определён: '{detected_sep}'"
+            )
+        
+        # Если разделитель не совпадает с указанным — обновляем
+        if detected_sep != self.sep:
+            self.sep = detected_sep
+        
+        return True
+
+    def _load_file(self, file_path: str, table_name: str, file_label: str = "",
+                   file_total_chunks: int = 0, cumulative_offset: int = 0, cumulative_total: int = 0):
+        """Загрузка CSV файла в SQLite с оптимизациями:
+        1. Один astype(str) вместо трёх
+        2. Векторизованное хеширование вместо apply(axis=1)
+        3. Прогресс-бар через progress_callback
+        """
+        all_cols = list(self.schema.keys())
+        
+        # Валидация столбцов перед загрузкой
+        try:
+            self._validate_columns(file_path, table_name)
+        except ValueError as e:
+            raise ValueError(str(e))
+        except Exception as e:
+            raise ValueError(f"Ошибка валидации {table_name}: {e}")
+        
+        cursor = self.conn.cursor()
+        batch_count = 0
+        commits_per_batch = 100  # commit() раз на 100 батчей (~50 000 строк)
+        current_chunk = 0
+        total_chunks = 0
+        
+        # Реальное количество чанков — считаем через тот же pd.read_csv
+        total_chunks = self._count_chunks(file_path, all_cols)
+        
+        try:
+            for chunk in pd.read_csv(file_path,
+                                      usecols=all_cols,
+                                      dtype=self.schema,
+                                      chunksize=self.chunksize,
+                                      encoding=self.encoding,
+                                      sep=self.sep,
+                                      engine='python'):
+                current_chunk += 1
+                
+                # Оптимизация: один astype(str) вместо трёх
+                # chunk_str = chunk.astype(str).fillna('')
+                # ВАЖНО: fillna ДО astype — иначе NaN превращается в строку 'nan'
+                # и fillna('') уже ничего не делает.
+                chunk_str = chunk.fillna('').astype(str)            
+
+                # Оптимизация: векторизованное хеширование
+                # key_strs = chunk_str[self.key_columns].copy()
+                # # Заменяем SEP внутри значений, чтобы не ломать парсинг
+                # key_strs = key_strs.replace(SEP, ' ', regex=True)
+                # key_hash_input = key_strs.agg(SEP.join, axis=1)
+                # Экранируем SEP во ВСЕХ строках один раз, а не только в ключах:
+                # иначе row_json/key_json содержат "сырой" \x01 и обратный
+                # split(SEP) в compare() даст некорректные столбцы.
+                chunk_str = chunk_str.replace(SEP, ' ', regex=True)
+
+                key_strs = chunk_str[self.key_columns]
+                key_hash_input = key_strs.agg(SEP.join, axis=1)
+
+                chunk['key_hash'] = key_hash_input.apply(
+                    lambda s: hashlib.md5(s.encode('utf-8')).hexdigest()
+                )
+
+                chunk['key_json'] = chunk_str[self.key_columns].agg(SEP.join, axis=1)
+                chunk['row_json'] = chunk_str[all_cols].agg(SEP.join, axis=1)
+                data = chunk[['key_hash', 'key_json', 'row_json']].values.tolist()
+                
+                for i in range(0, len(data), self.insert_batch_size):
+                    batch = data[i:i + self.insert_batch_size]
+                    cursor.executemany(
+                        f"INSERT INTO {table_name} (key_hash, key_json, row_json) VALUES (?, ?, ?)",
+                        batch
+                    )
+                    batch_count += 1
+                    # Commit раз на N батчей вместо каждого батча
+                    if batch_count % commits_per_batch == 0:
+                        self.conn.commit()
+                
+                # Эмитим прогресс после каждого чанка
+                if self.progress_callback:
+                    global_current = current_chunk + cumulative_offset if cumulative_offset else current_chunk
+                    global_total = cumulative_total if cumulative_total else file_total_chunks
+                    self.progress_callback(current_chunk, file_total_chunks,
+                                          global_current, global_total, file_label)
+        
+        except ValueError as e:
+            if "Usecols do not match columns" in str(e):
+                # Показываем какие столбцы есть в файле
+                try:
+                    actual_cols = pd.read_csv(file_path, nrows=0, encoding=self.encoding, sep=self.sep).columns.tolist()
+                except Exception:
+                    actual_cols = ["не удалось прочитать"]
+                raise ValueError(
+                    f"Столбцы схемы не совпадают со столбцами файла {file_path}:\n"
+                    f"  Ожидаются: {', '.join(all_cols)}\n"
+                    f"  В файле:   {', '.join(actual_cols)}\n"
+                    f"  Разделитель: '{self.sep}'\n\n"
+                    f"Проверьте, что выбрана правильная схема для этого файла."
+                ) from e
+            raise
+        
+        # Финальный commit
+        self.conn.commit()
+        
+        # Гарантируем прогресс для пустого файла (0 чанков)
+        if self.progress_callback and file_total_chunks == 0:
+            global_current = cumulative_offset if cumulative_offset else 0
+            global_total = cumulative_total if cumulative_total else 1
+            self.progress_callback(0, 1, global_current, global_total, file_label)
+
+    def _count_chunks(self, file_path: str, all_cols: list) -> int:
+        """Подсчёт реального количества чанков (итераций pd.read_csv)"""
+        count = 0
+        for _ in pd.read_csv(file_path,
+                              usecols=all_cols,
+                              chunksize=self.chunksize,
+                            #   low_memory=False,
+                              encoding=self.encoding,
+                              sep=self.sep,
+                              engine='python'):
+            count += 1
+        return max(1, count)
+
+    def _log(self, message: str):
+        """Отправка сообщения в лог"""
+        if self.log_callback:
+            self.log_callback(message)
+    
+    def _log_error(self, message: str):
+        """Отправка сообщения об ошибке в лог"""
+        if self.log_callback:
+            self.log_callback(message, is_error=True)
+    
+    def check_uniqueness(self) -> Tuple[Dict[str, Dict], List[Tuple]]:
+        """
+        Проверка уникальности ключей через SQL GROUP BY HAVING.
+        Использует key_json — сериализованные ключи, как в compare().
+        
+        Returns:
+            (results, dup_samples) — results: {table: {unique: bool, dup_keys: int, dup_rows: int}}
+            dup_samples: список кортежей (table_name, sample_df) для показа в UI
+        """
+        results = {}
+        dup_samples = []
+        
+        for table in ['df1', 'df2']:
+            cursor = self.conn.cursor()
+            
+            # Получаем общее количество строк для логирования
+            cursor.execute(f'SELECT COUNT(*) FROM {table}')
+            total_rows = cursor.fetchone()[0]
+            self._log(f"  Проверка уникальности в {table}: {total_rows} строк")
+            
+            # Группируем по key_json — тому же полю, что используется в compare()
+            query = f'''
+                SELECT key_json, COUNT(*) as cnt
+                FROM {table}
+                GROUP BY key_json
+                HAVING cnt > 1
+            '''
+            
+            try:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+            except Exception as e:
+                self._log(f"  ⚠️ Ошибка проверки уникальности в {table}: {e}")
+                results[table] = {'unique': True, 'dup_keys': 0, 'dup_rows': 0}
+                continue
+            
+            dup_keys_count = len(rows)
+            
+            if dup_keys_count == 0:
+                results[table] = {'unique': True, 'dup_keys': 0, 'dup_rows': 0}
+                self._log(f"  ✓ {table}: все {total_rows} ключей уникальны")
+            else:
+                # Подсчитываем общее количество строк с дубликатами
+                count_query = f'''
+                    SELECT COUNT(*) FROM {table}
+                    WHERE key_json IN (
+                        SELECT key_json FROM {table}
+                        GROUP BY key_json
+                        HAVING COUNT(*) > 1
+                    )
+                '''
+                cursor.execute(count_query)
+                dup_rows_count = cursor.fetchone()[0]
+                
+                results[table] = {'unique': False, 'dup_keys': dup_keys_count, 'dup_rows': dup_rows_count}
+                self._log_error(f"  ⚠️ {table}: {dup_keys_count} неуникальных ключей ({dup_rows_count} строк из {total_rows})")
+                
+                # Получаем примеры дублирующихся строк (до 20)
+                sample_query = f'''
+                    SELECT key_json, row_json FROM {table}
+                    WHERE key_json IN (
+                        SELECT key_json FROM {table}
+                        GROUP BY key_json
+                        HAVING COUNT(*) > 1
+                    )
+                    LIMIT 20
+                '''
+                cursor.execute(sample_query)
+                sample_data = cursor.fetchall()
+                
+                if sample_data:
+                    # Парсим key_json и row_json для показа всех столбцов
+                    sample_dfs = []
+                    all_cols = list(self.schema.keys())
+                    for key_json_val, row_json_val in sample_data:
+                        keys = key_json_val.split(SEP)
+                        row_values = row_json_val.split(SEP)
+                        key_dict = dict(zip(self.key_columns, keys))
+                        # Дополняем row_values до нужного количества столбцов
+                        while len(row_values) < len(all_cols):
+                            row_values.append('')
+                        row_dict = dict(zip(all_cols, row_values))
+                        # Объединяем ключевые столбцы (из key_json) и все столбцы (из row_json)
+                        row_dict.update(key_dict)
+                        sample_dfs.append(row_dict)
+                    sample_df = pd.DataFrame(sample_dfs)
+                    dup_samples.append((table, sample_df))
+        
+        return results, dup_samples
+    
+    def load_data(self):
+        # Считаем чанки для каждого файла заранее
+        all_cols = list(self.schema.keys())
+        df1_chunks = self._count_chunks(self.df1_path, all_cols)
+        df2_chunks = self._count_chunks(self.df2_path, all_cols)
+        total_all = df1_chunks + df2_chunks
+        
+        self._load_file(self.df1_path, 'df1', file_label='Файл 1',
+                        file_total_chunks=df1_chunks,
+                        cumulative_offset=0, cumulative_total=total_all)
+        self._load_file(self.df2_path, 'df2', file_label='Файл 2',
+                        file_total_chunks=df2_chunks,
+                        cumulative_offset=df1_chunks, cumulative_total=total_all)
+        
+        # Агрегация если включена
+        if self.agg_func:
+            self.aggregate(self.agg_func)
+
+    def aggregate(self, agg_func: str = 'sum'):
+        """
+        Агрегация дублирующихся строк по ключевым столбцам.
+        
+        Для каждого уникального ключа агрегирует неключевые столбцы:
+        - float: sum, mean, min, max
+        - string: первое значение (first)
+        
+        Args:
+            agg_func: функция агрегации ('sum', 'mean', 'min', 'max')
+        """
+        import io
+        import csv
+        
+        all_cols = list(self.schema.keys())
+        non_key_cols = [col for col in all_cols if col not in self.key_columns]
+        
+        self._log(f"\n{'='*60}")
+        self._log(f"НАЧАЛО АГРЕГАЦИИ ДУБЛИКАТОВ")
+        self._log(f"Функция агрегации: {agg_func}")
+        self._log(f"Ключевые столбцы: {', '.join(self.key_columns)}")
+        self._log(f"{'='*60}")
+
+        def _fmt_number(value, col_type):
+            """Возвращает строку в том же формате, что _load_file записал в row_json."""
+            if pd.isna(value):
+                return ''
+            if col_type == 'int':
+                return str(int(round(float(value))))
+            # col_type == 'float'
+            return str(float(value))
+
+        
+        for table in ['df1', 'df2']:
+            # Получаем количество строк до агрегации
+            cursor = self.conn.cursor()
+            cursor.execute(f'SELECT COUNT(*) FROM {table}')
+            rows_before = cursor.fetchone()[0]
+            self._log(f"\nОбработка {table}: {rows_before} строк до агрегации")
+            
+            # Читаем все данные из таблицы
+            # cursor.execute(f'SELECT key_json, row_json FROM {table} ORDER BY row_id')
+            cursor.execute(f'SELECT key_json, row_json FROM {table}')
+            rows = cursor.fetchall()
+            
+            if not rows:
+                self._log(f"  {table}: таблица пуста, пропуск")
+                continue
+            
+            # Парсим key_json и row_json
+            parsed_data = []
+            for key_json, row_json in rows:
+                keys = key_json.split(SEP)
+                values = row_json.split(SEP)
+                row_dict = dict(zip(all_cols, values))
+                key_dict = dict(zip(self.key_columns, keys))
+                parsed_data.append({**key_dict, **row_dict})
+            
+            # Создаём DataFrame
+            df = pd.DataFrame(parsed_data)
+            
+            # Определяем числовые колонки ПО СХЕМЕ
+            if classify_columns_by_schema:
+                numeric_cols, non_numeric_cols = classify_columns_by_schema(
+                    non_key_cols, self.schema, agg_func
+                )
+            else:
+                # Fallback: если utils недоступен
+                numeric_cols = []
+                non_numeric_cols = []
+                for col in non_key_cols:
+                    if agg_func == 'first':
+                        non_numeric_cols.append(col)
+                        continue
+                    col_type = self.schema.get(col)
+                    if col_type in ('float', 'int'):
+                        numeric_cols.append(col)
+                    else:
+                        non_numeric_cols.append(col)
+            
+            if numeric_cols:
+                self._log(f"  Числовые столбцы (агрегируются): {', '.join(numeric_cols)}")
+            if non_numeric_cols:
+                self._log(f"  Строковые столбцы (первое значение): {', '.join(non_numeric_cols)}")
+            
+            # Конвертируем числовые столбцы в float перед агрегацией
+            # (данные хранятся как строки в SQLite, pandas не может агрегировать строки)
+            for col in numeric_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            agg_dict = {col: agg_func for col in numeric_cols}
+            for col in non_numeric_cols:
+                agg_dict[col] = 'first'
+            
+            # Выполняем агрегацию
+            if agg_dict:
+                df_agg = df.groupby(self.key_columns, as_index=False).agg(agg_dict)
+            else:
+                df_agg = df.drop_duplicates(subset=self.key_columns, keep='first')
+            
+            # После groupby().agg() числовые столбцы стали float — конвертируем обратно в str
+            # для совместимости с последующим форматированием и вставкой в SQLite
+            for col in numeric_cols:
+                if col in df_agg.columns:
+                    df_agg[col] = df_agg[col].apply(lambda x: '' if pd.isna(x) else str(float(x)))
+            
+            rows_after = len(df_agg)
+            duplicates_removed = rows_before - rows_after
+            
+            self._log(f"  После агрегации: {rows_after} строк")
+            self._log(f"  Удалено дубликатов: {duplicates_removed}")
+            
+            if duplicates_removed > 0:
+                self._log(f"  ✓ {table} агрегирован: {rows_before} → {rows_after} строк")
+            else:
+                self._log(f"  ℹ {table} дубликатов не найдено")
+            
+            # Очищаем таблицу
+            self.conn.execute(f'DELETE FROM {table}')
+            
+            # Подготавливаем данные для вставки
+            data_to_insert = []
+            for _, row in df_agg.iterrows():
+                key_values = [str(row[col]) for col in self.key_columns]
+                
+                row_values = [
+                    _fmt_number(row[col], self.schema.get(col))
+                    if col in numeric_cols else str(row[col])
+                    for col in all_cols
+                ]
+
+                key_hash_input = SEP.join(key_values)
+                key_hash = hashlib.md5(key_hash_input.encode('utf-8')).hexdigest()
+                key_json = SEP.join(key_values)
+                row_json = SEP.join(row_values)
+                
+                data_to_insert.append((key_hash, key_json, row_json))
+            
+            # Вставляем агрегированные данные
+            cursor = self.conn.cursor()
+            for i in range(0, len(data_to_insert), self.insert_batch_size):
+                batch = data_to_insert[i:i + self.insert_batch_size]
+                cursor.executemany(
+                    f"INSERT INTO {table} (key_hash, key_json, row_json) VALUES (?, ?, ?)",
+                    batch
+                )
+            self.conn.commit()
+        
+        self._log(f"\nАГРЕГАЦИЯ ЗАВЕРШЕНА")
+        self._log(f"{'='*60}\n")
+
+    def _save_full_result_to_csv(self, query: str, columns: List[str], filename: str) -> str:
+        """Сохраняет результат запроса в CSV-файл и возвращает путь."""
+        if self._temp_dir is None:
+            self._temp_dir = tempfile.mkdtemp(prefix="comp_results_")
+        filepath = os.path.join(self._temp_dir, filename)
+        first_chunk = True
+        for chunk in pd.read_sql(query, self.conn, chunksize=self.chunksize):
+            if first_chunk:
+                chunk.to_csv(filepath, index=False, encoding='utf-8-sig', mode='w')
+                first_chunk = False
+            else:
+                chunk.to_csv(filepath, index=False, encoding='utf-8-sig', mode='a', header=False)
+        self._saved_files.append(filepath)
+        return filepath
+
+    def _expand_csv_columns(self, filename: str, mode: str = 'only'):
+        """Раскрывает key_json/row_json в отдельные столбцы схемы в сохранённом CSV.
+        
+        Args:
+            filename: имя файла в self._temp_dir
+            mode: 'only' — split row_json -> all_cols;
+                  'diff' — split row1/row2 -> all_cols_df1/all_cols_df2
+        """
+        filepath = os.path.join(self._temp_dir, filename)
+        if not os.path.exists(filepath):
+            return
+        
+        all_cols = list(self.schema.keys())
+        df = pd.read_csv(filepath, encoding='utf-8-sig')
+        
+        if mode == 'only':
+            # row_json -> all_cols
+            split_cols = df['row_json'].str.split(SEP, n=-1, expand=True)
+            # str.split(expand=True) может вернуть 0 столбцов если row_json пустой
+            if split_cols.empty and len(all_cols) > 0:
+                split_cols = pd.DataFrame(columns=all_cols)
+            elif split_cols.shape[1] != len(all_cols):
+                # Дополняем или обрезаем столбцы до ожидаемого количества
+                if split_cols.shape[1] < len(all_cols):
+                    for i in range(split_cols.shape[1], len(all_cols)):
+                        split_cols[i] = ''
+                split_cols = split_cols.iloc[:, :len(all_cols)]
+                split_cols.columns = all_cols
+            else:
+                split_cols.columns = all_cols
+            key_cols_df = df[['key_json']].copy()
+            # Раскрываем key_json -> key_columns
+            key_split = key_cols_df['key_json'].str.split(SEP, n=-1, expand=True)
+            if key_split.shape[1] != len(self.key_columns):
+                if key_split.empty and len(self.key_columns) > 0:
+                    key_split = pd.DataFrame(columns=self.key_columns)
+                elif key_split.shape[1] < len(self.key_columns):
+                    for i in range(key_split.shape[1], len(self.key_columns)):
+                        key_split[i] = ''
+                key_split = key_split.iloc[:, :len(self.key_columns)]
+                key_split.columns = self.key_columns
+            expanded = pd.concat([key_split, split_cols], axis=1)
+            expanded.to_csv(filepath, index=False, encoding='utf-8-sig')
+            
+        elif mode == 'diff':
+            # key_json + row1/row2 -> key_cols + all_cols_df1/all_cols_df2
+            key_cols_df = df[['key_json']].copy()
+            key_split = key_cols_df['key_json'].str.split(SEP, n=-1, expand=True)
+            if key_split.shape[1] != len(self.key_columns):
+                if key_split.empty and len(self.key_columns) > 0:
+                    key_split = pd.DataFrame(columns=self.key_columns)
+                elif key_split.shape[1] < len(self.key_columns):
+                    for i in range(key_split.shape[1], len(self.key_columns)):
+                        key_split[i] = ''
+                key_split = key_split.iloc[:, :len(self.key_columns)]
+                key_split.columns = self.key_columns
+            
+            row1_split = df['row1'].str.split(SEP, n=-1, expand=True)
+            df1_cols = [f"{col}_df1" for col in all_cols]
+            if row1_split.shape[1] != len(all_cols):
+                if row1_split.empty and len(all_cols) > 0:
+                    row1_split = pd.DataFrame(columns=df1_cols)
+                elif row1_split.shape[1] < len(all_cols):
+                    for i in range(row1_split.shape[1], len(all_cols)):
+                        row1_split[i] = ''
+                row1_split = row1_split.iloc[:, :len(all_cols)]
+                row1_split.columns = df1_cols
+            else:
+                row1_split.columns = df1_cols
+            
+            row2_split = df['row2'].str.split(SEP, n=-1, expand=True)
+            df2_cols = [f"{col}_df2" for col in all_cols]
+            if row2_split.shape[1] != len(all_cols):
+                if row2_split.empty and len(all_cols) > 0:
+                    row2_split = pd.DataFrame(columns=df2_cols)
+                elif row2_split.shape[1] < len(all_cols):
+                    for i in range(row2_split.shape[1], len(all_cols)):
+                        row2_split[i] = ''
+                row2_split = row2_split.iloc[:, :len(all_cols)]
+                row2_split.columns = df2_cols
+            else:
+                row2_split.columns = df2_cols
+            
+            # Собираем столбцы в правильном порядке: key + попарно col_df1, col_df2
+            # (как в режиме памяти)
+            ordered_cols = list(key_split.columns)
+            for col in all_cols:
+                df1_col = f"{col}_df1"
+                df2_col = f"{col}_df2"
+                if df1_col in row1_split.columns:
+                    ordered_cols.append(df1_col)
+                if df2_col in row2_split.columns:
+                    ordered_cols.append(df2_col)
+            
+            expanded = pd.concat([key_split, row1_split, row2_split], axis=1)[ordered_cols]
+            expanded.to_csv(filepath, index=False, encoding='utf-8-sig')
+
+    def _get_display_df(self, query: str, columns: List[str], limit: int) -> pd.DataFrame:
+        """Загружает только первые limit строк из запроса."""
+        limited_query = f"{query} LIMIT {limit}"
+        return pd.read_sql(limited_query, self.conn)
+
+    def compare(self):
+        all_cols = list(self.schema.keys())
+        non_key_cols = [col for col in all_cols if col not in self.key_columns]
+
+        # ---- 1. Только в df1 ----
+        # Оптимизация: LEFT JOIN вместо NOT IN
+        query_only1 = '''
+            SELECT a.key_json, a.row_json FROM df1 a
+            LEFT JOIN df2 b ON a.key_hash = b.key_hash
+            WHERE b.key_hash IS NULL
+        '''
+        self._save_full_result_to_csv(query_only1, ['key_json', 'row_json'], 'df1_only.csv')
+        self._expand_csv_columns('df1_only.csv', mode='only')
+        
+        # Получаем реальное количество строк для определения усечения
+        cursor = self.conn.cursor()
+        cursor.execute(query_only1.replace('SELECT a.key_json, a.row_json', 'SELECT COUNT(*)'))
+        total_only1 = cursor.fetchone()[0]
+        
+        df1_only_raw = self._get_display_df(query_only1, ['key_json', 'row_json'], self.max_display_rows)
+        if not df1_only_raw.empty:
+            split_rows = df1_only_raw['row_json'].str.split(SEP, expand=True)
+            if split_rows.shape[1] == len(all_cols):
+                split_rows.columns = all_cols
+                self.df1_only = split_rows
+            else:
+                self.df1_only = pd.DataFrame(columns=all_cols)
+        else:
+            self.df1_only = pd.DataFrame(columns=all_cols)
+        
+        self._truncated_df1_only = total_only1 > self.max_display_rows
+
+        # ---- 2. Только в df2 ----
+        # Оптимизация: LEFT JOIN вместо NOT IN
+        query_only2 = '''
+            SELECT a.key_json, a.row_json FROM df2 a
+            LEFT JOIN df1 b ON a.key_hash = b.key_hash
+            WHERE b.key_hash IS NULL
+        '''
+        self._save_full_result_to_csv(query_only2, ['key_json', 'row_json'], 'df2_only.csv')
+        self._expand_csv_columns('df2_only.csv', mode='only')
+        
+        cursor = self.conn.cursor()
+        cursor.execute(query_only2.replace('SELECT a.key_json, a.row_json', 'SELECT COUNT(*)'))
+        total_only2 = cursor.fetchone()[0]
+        
+        df2_only_raw = self._get_display_df(query_only2, ['key_json', 'row_json'], self.max_display_rows)
+        if not df2_only_raw.empty:
+            split_rows = df2_only_raw['row_json'].str.split(SEP, expand=True)
+            if split_rows.shape[1] == len(all_cols):
+                split_rows.columns = all_cols
+                self.df2_only = split_rows
+            else:
+                self.df2_only = pd.DataFrame(columns=all_cols)
+        else:
+            self.df2_only = pd.DataFrame(columns=all_cols)
+        
+        self._truncated_df2_only = total_only2 > self.max_display_rows
+
+        # ---- 3. Различия в значениях ----
+        query_diff = '''
+            SELECT a.key_json, a.row_json AS row1, b.row_json AS row2
+            FROM df1 a JOIN df2 b ON a.key_hash = b.key_hash
+            WHERE a.row_json != b.row_json
+        '''
+        
+        # Получаем все различия из SQL (по строковому сравнению)
+        cursor = self.conn.cursor()
+        cursor.execute(query_diff)
+        diff_rows = cursor.fetchall()
+        total_diff = len(diff_rows)
+        
+        # Применяем tolerance-фильтр к ПОЛНЫМ данным, а не только к отображаемым
+        if diff_rows:
+            # Парсим все различия
+            all_row1 = [r[1] for r in diff_rows]
+            all_row2 = [r[2] for r in diff_rows]
+            
+            diff_df = pd.DataFrame({'row1': all_row1, 'row2': all_row2})
+            
+            row1_split = diff_df['row1'].str.split(SEP, n=-1, expand=True)
+            row2_split = diff_df['row2'].str.split(SEP, n=-1, expand=True)
+            
+            # Дополняем недостающие колонки
+            if row1_split.shape[1] < len(all_cols):
+                for i in range(row1_split.shape[1], len(all_cols)):
+                    row1_split[i] = ''
+            if row2_split.shape[1] < len(all_cols):
+                for i in range(row2_split.shape[1], len(all_cols)):
+                    row2_split[i] = ''
+            row1_split = row1_split.iloc[:, :len(all_cols)]
+            row2_split = row2_split.iloc[:, :len(all_cols)]
+            row1_split.columns = all_cols
+            row2_split.columns = all_cols
+            
+            # Фильтр по tolerance: строка остаётся в отчёте,
+            # если ХОТЯ БЫ ОДИН неключевой столбец вне допуска.
+            mask = pd.Series(False, index=row1_split.index)
+            for col in non_key_cols:
+                if self.schema.get(col) == 'float':
+                    n1 = pd.to_numeric(row1_split[col], errors='coerce')
+                    n2 = pd.to_numeric(row2_split[col], errors='coerce')
+                    col_diff = ((n1 - n2).abs() > self.tolerance) | (n1.isna() ^ n2.isna())
+                    mask |= col_diff
+                elif self.schema.get(col) == 'string':
+                    mask |= (row1_split[col] != row2_split[col])
+            
+            # Фильтруем ПОЛНЫЕ данные по tolerance
+            row1_split_filtered = row1_split[mask]
+            row2_split_filtered = row2_split[mask]
+            
+            # Обновляем total_diff с учётом tolerance
+            total_diff = len(row1_split_filtered)
+            
+            # Сохраняем ФИЛЬТРОВАННЫЕ данные в CSV
+            if not row1_split_filtered.empty:
+                result_data = {}
+                for col in self.key_columns:
+                    # Получаем key_json для отфильтрованных строк
+                    filtered_indices = row1_split_filtered.index.tolist()
+                    result_data[col] = [diff_rows[i][0].split(SEP)[k] 
+                                       for i in filtered_indices 
+                                       for k, _ in enumerate(self.key_columns)]
+                
+                # Перестраиваем key_columns правильно
+                filtered_keys = [diff_rows[i][0] for i in row1_split_filtered.index.tolist()]
+                key_split_filtered = pd.DataFrame({'key_json': filtered_keys})
+                key_split = key_split_filtered['key_json'].str.split(SEP, n=-1, expand=True)
+                key_split.columns = self.key_columns
+                
+                result_data = {}
+                for col in self.key_columns:
+                    result_data[col] = key_split[col].values
+                for col in non_key_cols:
+                    result_data[f"{col}_df1"] = row1_split_filtered[col].values
+                    result_data[f"{col}_df2"] = row2_split_filtered[col].values
+                
+                diff_filtered = pd.DataFrame(result_data)
+                
+                # Сохраняем отфильтрованные данные
+                filepath = os.path.join(self._temp_dir, 'differences.csv') if self._temp_dir else None
+                if filepath is None:
+                    self._temp_dir = tempfile.mkdtemp(prefix="comp_results_")
+                    filepath = os.path.join(self._temp_dir, 'differences.csv')
+                diff_filtered.to_csv(filepath, index=False, encoding='utf-8-sig')
+                self._saved_files.append(filepath)
+                
+                # Применяем _expand_csv_columns
+                # Раскрываем столбцы (они уже раскрыты, просто обновляем файл)
+                df_csv = pd.read_csv(filepath, encoding='utf-8-sig')
+                # Столбцы уже в правильном формате (key + col_df1/col_df2)
+            else:
+                # Нет различий после фильтрации
+                filepath = os.path.join(self._temp_dir, 'differences.csv') if self._temp_dir else None
+                if filepath is None:
+                    self._temp_dir = tempfile.mkdtemp(prefix="comp_results_")
+                    filepath = os.path.join(self._temp_dir, 'differences.csv')
+                cols = self.key_columns + [f"{col}_df1" for col in non_key_cols] + \
+                       [f"{col}_df2" for col in non_key_cols]
+                pd.DataFrame(columns=cols).to_csv(filepath, index=False, encoding='utf-8-sig')
+                self._saved_files.append(filepath)
+        else:
+            total_diff = 0
+            filepath = os.path.join(self._temp_dir, 'differences.csv') if self._temp_dir else None
+            if filepath is None:
+                self._temp_dir = tempfile.mkdtemp(prefix="comp_results_")
+                filepath = os.path.join(self._temp_dir, 'differences.csv')
+            cols = self.key_columns + [f"{col}_df1" for col in non_key_cols] + \
+                   [f"{col}_df2" for col in non_key_cols]
+            pd.DataFrame(columns=cols).to_csv(filepath, index=False, encoding='utf-8-sig')
+            self._saved_files.append(filepath)
+        
+        self._total_diff = total_diff
+        
+        # Получаем отображаемые данные (лимитируем для UI)
+        diff_full_path = os.path.join(self._temp_dir, 'differences.csv')
+        if os.path.exists(diff_full_path):
+            diff_full = pd.read_csv(diff_full_path, encoding='utf-8-sig')
+            if len(diff_full) > self.max_display_rows:
+                diff_raw = diff_full.head(self.max_display_rows)
+                self._truncated_df1_df2_value = True
+            else:
+                diff_raw = diff_full
+        else:
+            diff_raw = pd.DataFrame()
+        
+        if not diff_raw.empty:
+            row1_split = diff_raw[[c for c in diff_raw.columns if c.endswith("_df1")]].copy()
+            row2_split = diff_raw[[c for c in diff_raw.columns if c.endswith("_df2")]].copy()
+            
+            # Восстанавливаем имена столбцов (без _df1/_df2)
+            df1_cols = [c[:-4] for c in row1_split.columns]
+            df2_cols = [c[:-4] for c in row2_split.columns]
+            row1_split.columns = df1_cols
+            row2_split.columns = df2_cols
+            
+            if not row1_split.empty:
+                result_data = {}
+                for col in self.key_columns:
+                    result_data[col] = diff_raw[col].values
+                for col in non_key_cols:
+                    result_data[f"{col}_df1"] = row1_split[col].values
+                    result_data[f"{col}_df2"] = row2_split[col].values
+                self.df1_df2_value = self._sort_columns_with_suffixes(
+                    pd.DataFrame(result_data), self.schema
+                )
+            else:
+                cols = self.key_columns + [f"{col}_df1" for col in non_key_cols] + \
+                       [f"{col}_df2" for col in non_key_cols]
+                self.df1_df2_value = pd.DataFrame(columns=cols)
+        else:
+            cols = self.key_columns + [f"{col}_df1" for col in non_key_cols] + \
+                   [f"{col}_df2" for col in non_key_cols]
+            self.df1_df2_value = pd.DataFrame(columns=cols)
+        
+        # diff_raw уже усечён на уровне SQL LIMIT, но mask может уменьшить количество строк.
+        # Реальное количество строк до маски = len(diff_raw), после = len(self.df1_df2_value).
+        # Показываем info про усечение по LIMIT.
+        if self.df1_df2_value is not None and not self.df1_df2_value.empty:
+            self._truncated_df1_df2_value = total_diff > self.max_display_rows
+
+        self._total_only1 = total_only1
+        self._total_only2 = total_only2
+        self._total_diff = total_diff    
+
+    def _sort_columns_with_suffixes(self, df: pd.DataFrame, schema: List[str] = None) -> pd.DataFrame:
+        """Передаёт работу общей утилите из utils.py"""
+        if sort_columns_with_suffixes:
+            return sort_columns_with_suffixes(df, self.key_columns, schema or self.schema)
+        # Fallback: оригинальная реализация
+        key_cols = [col for col in self.key_columns if col in df.columns]
+        other_cols = [col for col in df.columns if col not in key_cols]
+        base_names = set()
+        for col in other_cols:
+            if col.endswith("_df1"):
+                base_names.add(col[:-4])
+            elif col.endswith("_df2"):
+                base_names.add(col[:-4])
+            else:
+                base_names.add(col)
+        sorted_other_cols = []
+        for base_name in sorted(base_names):
+            df1_col = f"{base_name}_df1"
+            df2_col = f"{base_name}_df2"
+            if df1_col in other_cols:
+                sorted_other_cols.append(df1_col)
+            if df2_col in other_cols:
+                sorted_other_cols.append(df2_col)
+        return df[key_cols + sorted_other_cols]
+
+    def close(self):
+        # if self.conn:
+        #     self.conn.close()
+        # if self._temp_dir and os.path.exists(self._temp_dir):
+        #     import shutil
+        #     shutil.rmtree(self._temp_dir)
+        #     self._temp_dir = None
+
+        """Закрывает соединение с БД. Временные файлы НЕ удаляются —
+        для их удаления вызовите cleanup()."""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+
+    def cleanup(self):
+        """Удаляет временные файлы с полными результатами."""
+        if self._temp_dir and os.path.exists(self._temp_dir):
+            import shutil
+            shutil.rmtree(self._temp_dir)
+            self._temp_dir = None
+        self._saved_files = []
+
+    def get_saved_files(self) -> List[str]:
+        """Возвращает пути к сохранённым полным результатам."""
+        return self._saved_files
+
+
+===== FILE: ./data_frame_comparator.py =====
+import pandas as pd
+from typing import Dict, List, Tuple, Optional
+
+# Импортируем чанковый компаратор (если модуль доступен)
+try:
+    from chunked_comparator import ChunkedComparator
+except ImportError:
+    ChunkedComparator = None
+
+# Импортируем общие утилиты
+try:
+    from utils import sort_columns_with_suffixes, classify_columns_by_schema
+except ImportError:
+    sort_columns_with_suffixes = None
+    classify_columns_by_schema = None
+
+
+class InMemoryComparator:
+    """
+    Оригинальный класс для сравнения DataFrame в оперативной памяти.
+    (Переименован из DataFrameComparator для ясности.)
+    """
+    def __init__(self, df1: pd.DataFrame, df2: pd.DataFrame, float_tolerance: float = 0.0,
+                 schema_default=None,
+                 compare_columns: List[str] = None,
+                 agg_func: str = None,
+                 log_callback=None):
+        """
+        Инициализация компаратора датафреймов
+        """
+        self.df1 = df1.copy()
+        self.df2 = df2.copy()
+        self.float_tolerance = float_tolerance
+        self.agg_func = agg_func
+        self.log_callback = log_callback
+
+        if schema_default is None:
+            schema_default = {
+                "Код ЦФО": "string",
+                "Статья Hyperion Forecast": "string",
+                "Источник аллокации": "string",
+                "Сегмент для отчета": "string",
+                "Квартал": "string",
+                "Значение": "float",
+                "Пользовательская": "string",
+                "Версия": "string",
+                "План/Прогноз": "string",
+                "Группировка для анализа": "string",
+                "ДЗО": "string",
+                "БЕ": "string"
+            }
+        self.schema = schema_default
+
+        if compare_columns is None:
+            compare_columns = ["Код ЦФО", "Статья Hyperion Forecast", "Источник аллокации",
+                               "Сегмент для отчета", "Квартал", "ДЗО"]
+        self.key_columns = compare_columns
+
+        self.df1_only = None
+        self.df2_only = None
+        self.df1_df2_value = None
+
+    def _log(self, message: str):
+        """Отправка сообщения в лог"""
+        if self.log_callback:
+            self.log_callback(message)
+
+    def _log_error(self, message: str):
+        """Отправка сообщения об ошибке в лог"""
+        if self.log_callback:
+            self.log_callback(message, is_error=True)
+
+    def validate_schema(self) -> bool:
+        """Проверка соответствия схемы данных для обоих датафреймов"""
+        for df_name, df in [("df1", self.df1), ("df2", self.df2)]:
+            missing_columns = set(self.schema.keys()) - set(df.columns)
+            if missing_columns:
+                raise ValueError(
+                    f"В датафрейме {df_name} отсутствуют столбцы: {', '.join(missing_columns)}"
+                )
+            for column, expected_type in self.schema.items():
+                actual_type = df[column].dtype
+                if expected_type == "string":
+                    if not pd.api.types.is_string_dtype(actual_type):
+                        raise ValueError(
+                            f"В датафрейме {df_name} столбец '{column}' имеет тип {actual_type}, "
+                            f"ожидается string"
+                        )
+                elif expected_type == "float":
+                    if not pd.api.types.is_numeric_dtype(actual_type):
+                        raise ValueError(
+                            f"В датафрейме {df_name} столбец '{column}' имеет тип {actual_type}, "
+                            f"ожидается float"
+                        )
+                elif expected_type == "int":
+                    if not pd.api.types.is_integer_dtype(actual_type):
+                        raise ValueError(
+                            f"В датафрейме {df_name} столбец '{column}' имеет тип {actual_type}, "
+                            f"ожидается int"
+                        )
+                elif expected_type == "bool":
+                    if not pd.api.types.is_bool_dtype(actual_type):
+                        raise ValueError(
+                            f"В датафрейме {df_name} столбец '{column}' имеет тип {actual_type}, "
+                            f"ожидается bool"
+                        )
+        return True
+
+    def sort_dataframes(self) -> None:
+        """Сортировка датафреймов по ключевым столбцам"""
+        self.df1 = self.df1.sort_values(by=self.key_columns, ignore_index=True)
+        self.df2 = self.df2.sort_values(by=self.key_columns, ignore_index=True)
+
+    def _create_key(self, row: pd.Series) -> Tuple:
+        return tuple(row[col] for col in self.key_columns)
+
+    def _get_non_key_columns(self) -> List[str]:
+        return [col for col in self.schema.keys() if col not in self.key_columns]
+
+    def _values_equal(self, val1, val2) -> bool:
+        if pd.isna(val1) and pd.isna(val2):
+            return True
+        if pd.isna(val1) or pd.isna(val2):
+            return False
+        if isinstance(val1, (int, float)) and isinstance(val2, (int, float)):
+            return abs(float(val1) - float(val2)) <= self.float_tolerance
+        return val1 == val2
+
+    def aggregate(self, agg_func: str = 'sum'):
+        """
+        Агрегация дублирующихся строк по ключевым столбцам.
+        
+        Для каждого уникального ключа агрегирует неключевые столбцы:
+        - float: sum, mean, min, max
+        - string: первое значение (first)
+        
+        Args:
+            agg_func: функция агрегации ('sum', 'mean', 'min', 'max')
+        """
+        all_cols = list(self.schema.keys())
+        non_key_cols = [col for col in all_cols if col not in self.key_columns]
+        
+        self._log(f"\n{'='*60}")
+        self._log(f"НАЧАЛО АГРЕГАЦИИ ДУБЛИКАТОВ")
+        self._log(f"Функция агрегации: {agg_func}")
+        self._log(f"Ключевые столбцы: {', '.join(self.key_columns)}")
+        self._log(f"{'='*60}")
+        
+        for df_name, df in [('df1', self.df1), ('df2', self.df2)]:
+            # Получаем количество строк до агрегации
+            rows_before = len(df)
+            self._log(f"\nОбработка {df_name}: {rows_before} строк до агрегации")
+            
+            if df.empty:
+                self._log(f"  {df_name}: таблица пуста, пропуск")
+                continue
+            
+            # Определяем числовые колонки ПО СХЕМЕ, а не по значениям.
+            # Причины: (1) детерминизм, (2) согласованность с chunked режимом,
+            # (3) одинаковое поведение для df1 и df2.
+            if classify_columns_by_schema:
+                numeric_cols, non_numeric_cols = classify_columns_by_schema(
+                    non_key_cols, self.schema, agg_func
+                )
+            else:
+                # Fallback: если utils недоступен
+                numeric_cols = []
+                non_numeric_cols = []
+                for col in non_key_cols:
+                    if agg_func == 'first':
+                        non_numeric_cols.append(col)
+                        continue
+                    col_type = self.schema.get(col)
+                    if col_type in ('float', 'int'):
+                        numeric_cols.append(col)
+                    else:
+                        non_numeric_cols.append(col)
+            
+            if numeric_cols:
+                self._log(f"  Числовые столбцы (агрегируются): {', '.join(numeric_cols)}")
+            if non_numeric_cols:
+                self._log(f"  Строковые столбцы (первое значение): {', '.join(non_numeric_cols)}")
+            
+            # Строим словарь агрегации: числовые — по agg_func, остальные — 'first'
+            agg_dict = {col: agg_func for col in numeric_cols}
+            for col in non_numeric_cols:
+                agg_dict[col] = 'first'
+            
+            # Выполняем агрегацию
+            if agg_dict:
+                df_agg = df.groupby(self.key_columns, as_index=False).agg(agg_dict)
+            else:
+                df_agg = df.drop_duplicates(subset=self.key_columns, keep='first')
+            
+            rows_after = len(df_agg)
+            duplicates_removed = rows_before - rows_after
+            
+            self._log(f"  После агрегации: {rows_after} строк")
+            self._log(f"  Удалено дубликатов: {duplicates_removed}")
+            
+            if duplicates_removed > 0:
+                self._log(f"  ✓ {df_name} агрегирован: {rows_before} → {rows_after} строк")
+            else:
+                self._log(f"  ℹ {df_name} дубликатов не найдено")
+            
+            # Обновляем DataFrame
+            if df_name == 'df1':
+                self.df1 = df_agg
+            else:
+                self.df2 = df_agg
+        
+        self._log(f"\nАГРЕГАЦИЯ ЗАВЕРШЕНА")
+        self._log(f"{'='*60}\n")
+
+    def compare(self) -> None:
+        """Выполнение сравнения датафреймов"""
+        # Агрегация если включена
+        if self.agg_func:
+            self.aggregate(self.agg_func)
+        
+        self.validate_schema()
+        self.sort_dataframes()
+
+        non_key_columns = self._get_non_key_columns()
+
+        # Обработка дубликатов: если агрегация не включена — оставляем первую строку
+        # и предупреждаем пользователя.
+        # check_uniqueness() уже вызван заранее в main.py.
+        for df_name, df in [('df1', self.df1), ('df2', self.df2)]:
+            dup_mask = df.duplicated(subset=self.key_columns, keep='first')
+            if dup_mask.any():
+                dup_count = int(dup_mask.sum())
+                self._log(
+                    f"  ⚠️ {df_name}: {dup_count} строк с дублирующимися ключами "
+                    f"(оставлена первая строка из каждой группы)"
+                )
+                if df_name == 'df1':
+                    self.df1 = df[~dup_mask].reset_index(drop=True)
+                else:
+                    self.df2 = df[~dup_mask].reset_index(drop=True)
+
+        merged = self.df1.merge(
+            self.df2,
+            on=self.key_columns,
+            how='outer',
+            suffixes=('_df1', '_df2'),
+            indicator=True,
+            sort=False,
+        )
+
+        df1_cols = list(self.key_columns) + [f"{c}_df1" for c in non_key_columns]
+        df2_cols = list(self.key_columns) + [f"{c}_df2" for c in non_key_columns]
+        flat_cols = list(self.key_columns) + list(non_key_columns)
+
+        only1 = merged.loc[merged['_merge'] == 'left_only', df1_cols].reset_index(drop=True)
+        only1.columns = flat_cols
+        only2 = merged.loc[merged['_merge'] == 'right_only', df2_cols].reset_index(drop=True)
+        only2.columns = flat_cols
+
+        self.df1_only = only1 if not only1.empty else pd.DataFrame(columns=self.df1.columns)
+        self.df2_only = only2 if not only2.empty else pd.DataFrame(columns=self.df2.columns)
+
+        both = merged.loc[merged['_merge'] == 'both'].reset_index(drop=True)
+        if both.empty:
+            self.df1_df2_value = None
+            return
+
+        # Векторизованная маска: строка различий, если ХОТЯ БЫ ОДИН
+        # неключевой столбец не совпал (учитываем tolerance и NaN)
+        diff_mask = pd.Series(False, index=both.index)
+        for col in non_key_columns:
+            s1 = both[f"{col}_df1"]
+            s2 = both[f"{col}_df2"]
+            both_na = s1.isna() & s2.isna()
+            if pd.api.types.is_numeric_dtype(s1) and pd.api.types.is_numeric_dtype(s2):
+                diff = (s1.astype(float) - s2.astype(float)).abs()
+                equal = (diff <= self.float_tolerance) | both_na
+            else:
+                equal = (s1 == s2) | both_na
+            diff_mask |= ~equal
+
+        diff_df = both.loc[diff_mask]
+        if diff_df.empty:
+            self.df1_df2_value = None
+            return
+
+        result_data = {}
+        for col in self.key_columns:
+            result_data[col] = diff_df[col].values
+        for col in non_key_columns:
+            result_data[f"{col}_df1"] = diff_df[f"{col}_df1"].values
+            result_data[f"{col}_df2"] = diff_df[f"{col}_df2"].values
+        self.df1_df2_value = self._sort_columns_with_suffixes(
+            pd.DataFrame(result_data), self.schema
+        )
+
+    def _sort_columns_with_suffixes(self, df: pd.DataFrame, schema: List[str] = None) -> pd.DataFrame:
+        """Передаёт работу общей утилите из utils.py"""
+        if sort_columns_with_suffixes:
+            return sort_columns_with_suffixes(df, self.key_columns, schema or self.schema)
+        # Fallback: оригинальная реализация
+        key_cols = [col for col in self.key_columns if col in df.columns]
+        other_cols = [col for col in df.columns if col not in key_cols]
+        base_names = set()
+        for col in other_cols:
+            if col.endswith("_df1"):
+                base_names.add(col[:-4])
+            elif col.endswith("_df2"):
+                base_names.add(col[:-4])
+            else:
+                base_names.add(col)
+        sorted_other_cols = []
+        for base_name in sorted(base_names):
+            df1_col = f"{base_name}_df1"
+            df2_col = f"{base_name}_df2"
+            if df1_col in other_cols:
+                sorted_other_cols.append(df1_col)
+            if df2_col in other_cols:
+                sorted_other_cols.append(df2_col)
+        return df[key_cols + sorted_other_cols]
+
+    def check_uniqueness(self) -> Tuple[Dict[str, Dict], List[Tuple]]:
+        """
+        Проверка уникальности ключей.
+        
+        Returns:
+            (results, dup_samples) — results: {table: {unique: bool, dup_keys: int, dup_rows: int}}
+            dup_samples: список кортежей (table_name, sample_df) для показа в UI
+        """
+        SEP = '\x01'
+        results = {}
+        dup_samples = []
+        
+        for df_name, df in [('df1', self.df1), ('df2', self.df2)]:
+            if not self.key_columns or df.empty:
+                results[df_name] = {'unique': True, 'dup_keys': 0, 'dup_rows': 0}
+                continue
+            
+            # Создаём составной ключ (аналог key_json в ChunkedComparator)
+            df_temp = df.copy()
+            df_temp['_composite_key'] = df_temp[self.key_columns].astype(str).agg(SEP.join, axis=1)
+            
+            # Находим дублирующиеся ключи
+            key_counts = df_temp['_composite_key'].value_counts()
+            dup_keys = key_counts[key_counts > 1]
+            
+            if len(dup_keys) == 0:
+                results[df_name] = {'unique': True, 'dup_keys': 0, 'dup_rows': 0}
+                self._log(f"  ✓ {df_name}: ключи уникальны")
+            else:
+                dup_keys_count = len(dup_keys)
+                dup_rows_count = int(dup_keys.sum())
+                
+                results[df_name] = {'unique': False, 'dup_keys': dup_keys_count, 'dup_rows': dup_rows_count}
+                self._log_error(f"  ⚠️ {df_name}: обнаружено {dup_keys_count} неуникальных ключей ({dup_rows_count} строк)")
+                
+                # Получаем примеры дублирующихся строк (до 20)
+                dup_mask = df_temp['_composite_key'].isin(dup_keys.index)
+                sample_data = df_temp[dup_mask].head(20)
+                
+                if not sample_data.empty:
+                    all_cols = list(self.schema.keys())
+                    sample_dfs = []
+                    for _, row in sample_data.iterrows():
+                        row_dict = {col: row[col] for col in all_cols}
+                        sample_dfs.append(row_dict)
+                    sample_df = pd.DataFrame(sample_dfs)
+                    dup_samples.append((df_name, sample_df))
+        
+        return results, dup_samples
+
+
+# -------------------------------------------
+# ФАБРИКА КОМПАРАТОРОВ
+# -------------------------------------------
+
+def create_comparator(df1, df2, key_columns, schema, tolerance=0.0,
+                      use_chunked=False, df1_path=None, df2_path=None,
+                      chunksize=50000, db_path=None, encoding='utf-8', separator=',',
+                      agg_func=None, log_callback=None, progress_callback=None):
+    """
+    Возвращает подходящий компаратор в зависимости от режима.
+
+    Параметры:
+        df1, df2: DataFrame (для in-memory режима) или None (для чанкового)
+        key_columns: список ключевых столбцов
+        schema: словарь типов
+        tolerance: допуск для float
+        use_chunked: если True, используется чанковый режим
+        df1_path, df2_path: пути к CSV (обязательны при use_chunked=True)
+        chunksize: размер чанка
+        db_path: путь к SQLite (по умолчанию :memory:)
+
+    Возвращает:
+        Объект с методами compare() и атрибутами df1_only, df2_only, df1_df2_value.
+    """
+    if use_chunked:
+        if ChunkedComparator is None:
+            raise RuntimeError(
+                "Чанковый режим недоступен: модуль chunked_comparator "
+                "не импортирован (проверьте установку зависимостей)."
+            )
+        if not df1_path or not df2_path:
+            raise ValueError(
+                "Для чанкового режима обязательны df1_path и df2_path."
+            )
+        return ChunkedComparator(
+            df1_path, df2_path,
+            key_columns, schema, tolerance,
+            chunksize=chunksize,
+            db_path=db_path,
+            encoding=encoding,
+            sep=separator,
+            agg_func=agg_func,
+            log_callback=log_callback,
+            progress_callback=progress_callback
+        )
+    if df1 is None or df2 is None:
+        raise ValueError(
+            "Для in-memory режима обязательны df1 и df2 (DataFrame)."
+        )
+    return InMemoryComparator(df1, df2, tolerance, schema, key_columns,
+                              agg_func=agg_func, log_callback=log_callback)   
+
+
+===== FILE: ./main.py =====
+import sys
+import os
+import json
+import sqlite3
+import subprocess 
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple
+from datetime import datetime
+
+import pandas as pd
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QFileDialog, QLabel, QTextEdit, QSpinBox,
+    QGroupBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
+    QHeaderView, QMessageBox, QProgressBar, QLineEdit, QComboBox,
+    QCheckBox, QDialog, QDialogButtonBox, QTextBrowser, QSizePolicy
+)
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont, QTextCursor, QIcon, QAction, QColor
+
+from read_csv_with_schema import read_csv_with_schema_v1
+# ИЗМЕНЕНО: используем фабрику вместо прямого импорта класса
+from data_frame_comparator import create_comparator, InMemoryComparator
+# Общие утилиты
+from utils import parse_schema_text, parse_key_columns, auto_detect_separator
+
+
+class SchemaManager:
+    """Менеджер для работы со схемами данных"""
+    
+    def __init__(self):
+        # Путь к файлу схем относительно main.py
+        self.schema_file = self._get_schema_file_path()
+        self.schemas = {}
+        self._ensure_default_schemas()
+        self.load_schemas()
+    
+    def _get_schema_file_path(self) -> str:
+        """Получение пути к файлу схем относительно main.py"""
+        # Получаем путь к каталогу main.py
+        main_dir = Path(__file__).parent.resolve()
+        return str(main_dir / "schemas.json")
+    
+    def _ensure_default_schemas(self):
+        """Создание файла со схемами по умолчанию, если он не существует"""
+        if not os.path.exists(self.schema_file):
+            default_schemas = {
+                "schemas": {
+                    "Стандартная (12 полей)": {
+                        'schema': {
+                            "Код ЦФО": "string",
+                            "Статья Hyperion Forecast": "string",
+                            "Источник аллокации": "string",
+                            "Сегмент для отчета": "string",
+                            "Квартал": "string",
+                            "Значение": "float",
+                            "Пользовательская": "string",
+                            "Версия": "string",
+                            "План/Прогноз": "string",
+                            "Группировка для анализа": "string",
+                            "ДЗО": "string",
+                            "БЕ": "string"
+                        },
+                        'key_columns': [
+                            "Код ЦФО", "Статья Hyperion Forecast", 
+                            "Источник аллокации", "Сегмент для отчета", 
+                            "Квартал", "ДЗО"
+                        ],
+                        'tolerance': 0.0
+                    },
+                    "DZO Revenue Forecast 9+3": {
+                        'schema': {
+                            "Код ДЗО Forecast": "string",
+                            "Код ЦФО": "string",
+                            "Статья Hyperion Forecast": "string",
+                            "Сегмент для отчета": "string",
+                            "Источник аллокации": "string",
+                            "Q3": "string",
+                            "Q4": "float",
+                            "Jul": "float",
+                            "Aug": "float",
+                            "Sep": "float",
+                            "Oct": "float",
+                            "Nov": "float",
+                            "Dec": "float"
+                        },
+                        'key_columns': [
+                            "Код ДЗО Forecast", "Код ЦФО",
+                            "Статья Hyperion Forecast", "Сегмент для отчета",
+                            "Источник аллокации"
+                        ],
+                        'tolerance': 0.0001
+                    },
+                    "DZO Revenue Forecast (Q)": {
+                        'schema': {
+                            "Код ДЗО Forecast": "string",
+                            "Код ЦФО": "string",
+                            "Статья Hyperion Forecast": "string",
+                            "Сегмент для отчета": "string",
+                            "Источник аллокации": "string",
+                            "Квартал": "string",
+                            "Значение": "float"
+                        },
+                        'key_columns': [
+                            "Код ДЗО Forecast", "Код ЦФО",
+                            "Статья Hyperion Forecast", "Сегмент для отчета",
+                            "Источник аллокации", "Квартал"
+                        ],
+                        'tolerance': 0.0
+                    },
+                    "DZO Percent": {
+                        'schema': {
+                            "Код ДЗО Forecast": "string",
+                            "Сегмент для отчета": "string",
+                            "%": "float"
+                        },
+                        'key_columns': [
+                            "Код ДЗО Forecast", "Сегмент для отчета"
+                        ],
+                        'tolerance': 0.0
+                    }
+                }
+            }
+            
+            try:
+                with open(self.schema_file, 'w', encoding='utf-8') as f:
+                    json.dump(default_schemas, f, ensure_ascii=False, indent=2)
+                print(f"Создан файл схем по умолчанию: {self.schema_file}")
+            except Exception as e:
+                print(f"Ошибка создания файла схем: {e}")
+    
+    def load_schemas(self):
+        """Загрузка схем из JSON файла"""
+        if os.path.exists(self.schema_file):
+            try:
+                with open(self.schema_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.schemas = data.get('schemas', {})
+                    
+                    # Проверяем, что каждая схема имеет поле tolerance
+                    for name, schema_data in self.schemas.items():
+                        if 'tolerance' not in schema_data:
+                            schema_data['tolerance'] = 0.0
+                    
+                    print(f"Загружено {len(self.schemas)} схем из {self.schema_file}")
+            except Exception as e:
+                print(f"Ошибка загрузки схем: {e}")
+                self.schemas = {}
+        else:
+            print(f"Файл схем не найден: {self.schema_file}")
+            self.schemas = {}
+    
+    def save_schemas(self):
+        """Сохранение схем в JSON файл"""
+        try:
+            with open(self.schema_file, 'w', encoding='utf-8') as f:
+                json.dump({'schemas': self.schemas}, f, ensure_ascii=False, indent=2)
+            print(f"Схемы сохранены в {self.schema_file}")
+            return True
+        except Exception as e:
+            print(f"Ошибка сохранения схем: {e}")
+            return False
+    
+    def get_schema(self, name: str) -> Dict:
+        """Получение схемы по имени"""
+        return self.schemas.get(name, {})
+    
+    def add_schema(self, name: str, schema: Dict, key_columns: List[str] = None, tolerance: float = 0.0):
+        """Добавление или обновление схемы"""
+        self.schemas[name] = {
+            'schema': schema,
+            'key_columns': key_columns or [],
+            'tolerance': tolerance
+        }
+        return self.save_schemas()
+    
+    def update_schema(self, old_name: str, new_name: str, schema: Dict, key_columns: List[str] = None, tolerance: float = 0.0):
+        """Обновление схемы с возможностью переименования"""
+        # Если имя изменилось, удаляем старую схему
+        if old_name != new_name and old_name in self.schemas:
+            del self.schemas[old_name]
+        
+        self.schemas[new_name] = {
+            'schema': schema,
+            'key_columns': key_columns or [],
+            'tolerance': tolerance
+        }
+        return self.save_schemas()
+    
+    def delete_schema(self, name: str) -> bool:
+        """Удаление схемы"""
+        if name in self.schemas:
+            del self.schemas[name]
+            return self.save_schemas()
+        return False
+    
+    def get_schema_names(self) -> List[str]:
+        """Получение списка имен схем"""
+        return list(self.schemas.keys())
+    
+    def get_schema_file_path(self) -> str:
+        """Получение пути к файлу схем"""
+        return self.schema_file
+
+
+class SchemaEditorDialog(QDialog):
+    """Диалог для редактирования схемы (табличный формат)"""
+    
+    def __init__(self, schema_manager: SchemaManager, schema_name: str = "", 
+                 schema_data: Dict = None, parent=None):
+        super().__init__(parent)
+        self.schema_manager = schema_manager
+        self.schema_name = schema_name
+        self.schema_data = schema_data or {'schema': {}, 'key_columns': [], 'tolerance': 0.0}
+        self.result = None
+        
+        self.setWindowTitle(f"Редактирование схемы: {schema_name}" if schema_name else "Новая схема")
+        self.setMinimumSize(700, 600)
+        
+        self.init_ui()
+        self._load_data()
+        
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Имя схемы
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(QLabel("Имя схемы:"))
+        self.name_edit = QLineEdit()
+        name_layout.addWidget(self.name_edit)
+        layout.addLayout(name_layout)
+        
+        # Таблица схемы
+        table_label = QLabel("Столбцы схемы:")
+        table_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(table_label)
+        
+        self.schema_table = QTableWidget()
+        self.schema_table.setColumnCount(3)
+        self.schema_table.setHorizontalHeaderLabels(["Имя столбца", "Тип", "Ключевой"])
+        self.schema_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.schema_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.schema_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.schema_table.setMinimumHeight(250)
+        layout.addWidget(self.schema_table)
+        
+        # Кнопки управления таблицей
+        table_buttons_layout = QHBoxLayout()
+        
+        btn_add_row = QPushButton("+ Добавить столбец")
+        btn_add_row.clicked.connect(self._add_row)
+        table_buttons_layout.addWidget(btn_add_row)
+        
+        btn_remove_row = QPushButton("− Удалить столбец")
+        btn_remove_row.clicked.connect(self._remove_row)
+        table_buttons_layout.addWidget(btn_remove_row)
+        
+        btn_move_up = QPushButton("↑ Вверх")
+        btn_move_up.clicked.connect(lambda: self._move_row(-1))
+        table_buttons_layout.addWidget(btn_move_up)
+        
+        btn_move_down = QPushButton("↓ Вниз")
+        btn_move_down.clicked.connect(lambda: self._move_row(1))
+        table_buttons_layout.addWidget(btn_move_down)
+        
+        table_buttons_layout.addStretch()
+        layout.addLayout(table_buttons_layout)
+        
+        # Точность
+        tolerance_layout = QHBoxLayout()
+        tolerance_layout.addWidget(QLabel("Точность сравнения (0 - точное совпадение):"))
+        self.tolerance_spin = QSpinBox()
+        self.tolerance_spin.setRange(0, 1000000)
+        self.tolerance_spin.setSuffix(" (10⁻⁶)")
+        tolerance_layout.addWidget(self.tolerance_spin)
+        layout.addLayout(tolerance_layout)
+        
+        # Информация о файле
+        info_label = QLabel(f"Схемы сохраняются в: {self.schema_manager.get_schema_file_path()}")
+        info_label.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(info_label)
+        
+        # Кнопки
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept_schema)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+    def _load_data(self):
+        """Загрузка данных в таблицу"""
+        self.name_edit.setText(self.schema_name)
+        tolerance_value = int(self.schema_data.get('tolerance', 0) * 1000000)
+        self.tolerance_spin.setValue(tolerance_value)
+        
+        schema = self.schema_data.get('schema', {})
+        key_columns = self.schema_data.get('key_columns', [])
+        
+        for col_name, col_type in schema.items():
+            row = self.schema_table.rowCount()
+            self.schema_table.insertRow(row)
+            
+            # Имя столбца
+            name_item = QTableWidgetItem(col_name)
+            name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+            self.schema_table.setItem(row, 0, name_item)
+            
+            # Тип (combobox)
+            type_combo = QComboBox()
+            type_combo.addItems(["string", "float", "int", "bool"])
+            type_combo.setCurrentText(col_type)
+            self.schema_table.setCellWidget(row, 1, type_combo)
+            
+            # Чекбокс ключевого столбца
+            is_key = col_name in key_columns
+            key_checkbox = QCheckBox()
+            key_checkbox.setChecked(is_key)
+            key_widget = QWidget()
+            key_layout = QHBoxLayout(key_widget)
+            key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+            key_layout.addWidget(key_checkbox)
+            key_layout.setContentsMargins(0, 0, 0, 0)
+            self.schema_table.setCellWidget(row, 2, key_widget)
+    
+    def _add_row(self):
+        """Добавление новой строки"""
+        row = self.schema_table.rowCount()
+        self.schema_table.insertRow(row)
+        
+        name_item = QTableWidgetItem("")
+        name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+        self.schema_table.setItem(row, 0, name_item)
+        
+        type_combo = QComboBox()
+        type_combo.addItems(["string", "float", "int", "bool"])
+        type_combo.setCurrentText("string")
+        self.schema_table.setCellWidget(row, 1, type_combo)
+        
+        key_checkbox = QCheckBox()
+        key_checkbox.setChecked(False)
+        key_widget = QWidget()
+        key_layout = QHBoxLayout(key_widget)
+        key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+        key_layout.addWidget(key_checkbox)
+        key_layout.setContentsMargins(0, 0, 0, 0)
+        self.schema_table.setCellWidget(row, 2, key_widget)
+    
+    def _remove_row(self):
+        """Удаление выбранной строки"""
+        current_row = self.schema_table.currentRow()
+        if current_row >= 0:
+            self.schema_table.removeRow(current_row)
+        elif self.schema_table.rowCount() > 0:
+            self.schema_table.removeRow(0)
+    
+    def _move_row(self, direction: int):
+        """Перемещение строки вверх или вниз"""
+        current_row = self.schema_table.currentRow()
+        new_row = current_row + direction
+        
+        if new_row < 0 or new_row >= self.schema_table.rowCount():
+            return
+        
+        row_data = []
+        for col in range(3):
+            item = self.schema_table.item(current_row, col)
+            if item:
+                row_data.append(item.text())
+            else:
+                widget = self.schema_table.cellWidget(current_row, col)
+                if widget:
+                    if col == 1:
+                        row_data.append(widget.currentText())
+                    elif col == 2:
+                        row_data.append(widget.findChild(QCheckBox).isChecked())
+                else:
+                    row_data.append("")
+        
+        self.schema_table.removeRow(current_row)
+        self.schema_table.insertRow(new_row)
+        
+        for col in range(3):
+            if col == 0:
+                name_item = QTableWidgetItem(row_data[col])
+                name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+                self.schema_table.setItem(new_row, col, name_item)
+            elif col == 1:
+                type_combo = QComboBox()
+                type_combo.addItems(["string", "float", "int", "bool"])
+                type_combo.setCurrentText(row_data[col])
+                self.schema_table.setCellWidget(new_row, col, type_combo)
+            elif col == 2:
+                key_checkbox = QCheckBox()
+                key_checkbox.setChecked(row_data[col])
+                key_widget = QWidget()
+                key_layout = QHBoxLayout(key_widget)
+                key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+                key_layout.addWidget(key_checkbox)
+                key_layout.setContentsMargins(0, 0, 0, 0)
+                self.schema_table.setCellWidget(new_row, col, key_widget)
+        
+        self.schema_table.setCurrentCell(new_row, 0)
+    
+    def _get_schema_from_table(self) -> Dict[str, str]:
+        """Получение схемы из таблицы"""
+        schema = {}
+        for row in range(self.schema_table.rowCount()):
+            name_item = self.schema_table.item(row, 0)
+            if not name_item or not name_item.text().strip():
+                continue
+            
+            type_combo = self.schema_table.cellWidget(row, 1)
+            col_type = type_combo.currentText() if type_combo else "string"
+            
+            schema[name_item.text().strip()] = col_type
+        
+        return schema
+    
+    def _get_key_columns_from_table(self) -> List[str]:
+        """Получение ключевых столбцов из таблицы"""
+        key_columns = []
+        for row in range(self.schema_table.rowCount()):
+            key_widget = self.schema_table.cellWidget(row, 2)
+            if key_widget:
+                checkbox = key_widget.findChild(QCheckBox)
+                if checkbox and checkbox.isChecked():
+                    name_item = self.schema_table.item(row, 0)
+                    if name_item and name_item.text().strip():
+                        key_columns.append(name_item.text().strip())
+        return key_columns
+        
+    def accept_schema(self):
+        """Обработка подтверждения"""
+        try:
+            name = self.name_edit.text().strip()
+            if not name:
+                QMessageBox.warning(self, "Предупреждение", "Введите имя схемы!")
+                return
+            
+            # Получаем схему из таблицы
+            schema = self._get_schema_from_table()
+            
+            if not schema:
+                QMessageBox.warning(self, "Предупреждение", "Добавьте хотя бы один столбец!")
+                return
+            
+            # Получаем ключевые столбцы
+            key_columns = self._get_key_columns_from_table()
+            
+            # Получаем точность
+            # tolerance = self.current_tolerance
+            tolerance = self.tolerance_spin.value() / 1_000_000
+            
+            # Проверяем, что все ключевые столбцы есть в схеме
+            missing = [c for c in key_columns if c not in schema]
+            if missing:
+                QMessageBox.warning(
+                    self, "Предупреждение",
+                    f"Ключевые столбцы отсутствуют в схеме: {', '.join(missing)}"
+                )
+                return
+            
+            self.result = {
+                'name': name,
+                'schema': schema,
+                'key_columns': key_columns,
+                'tolerance': tolerance
+            }
+            
+            self.accept()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+
+
+
+# ============================================================
+# НОВЫЙ КЛАСС CompareWorker с поддержкой чанкового режима
+# ============================================================
+class CompareWorker(QThread):
+    """Поток для выполнения сравнения без блокировки UI"""
+    progress = Signal(str)
+    log_message = Signal(str, bool)
+    finished = Signal(object)
+    error = Signal(str)
+    key_uniqueness_warning = Signal(str, str)
+    progress_chunk = Signal(int, int, int, int, str)  # file_current, file_total, global_current, global_total, file_label
+    duplicates_found = Signal(str, pd.DataFrame)  # table_name, sample_df
+    
+    def __init__(self, df1, df2, schema, compare_columns, tolerance,
+                 use_chunked=False, df1_path=None, df2_path=None,
+                 chunksize=50000, encoding='utf-8', csv_separator=',',
+                 agg_func=None, log_callback=None):
+        super().__init__()
+        self.df1 = df1
+        self.df2 = df2
+        self.schema = schema
+        self.compare_columns = compare_columns
+        self.tolerance = tolerance
+        self.use_chunked = use_chunked
+        self.df1_path = df1_path
+        self.df2_path = df2_path
+        self.chunksize = chunksize
+        self.encoding = encoding
+        self.csv_separator = csv_separator
+        self.agg_func = agg_func
+        self.log_callback = log_callback
+    
+    def run(self):
+        comparator = None 
+        try:
+            self.progress.emit("Создание компаратора...")
+            
+            # Автоопределение разделителя для чанкового режима
+            csv_separator = self.csv_separator
+            if self.use_chunked and self.df1_path:
+                csv_separator = auto_detect_separator(self.df1_path, self.encoding)
+                self.progress.emit(f"  Разделитель определён: '{csv_separator}'")
+            
+            # ИСПОЛЬЗУЕМ ФАБРИКУ
+            comparator = create_comparator(
+                self.df1, self.df2,
+                self.compare_columns,
+                self.schema,
+                self.tolerance,
+                use_chunked=self.use_chunked,
+                df1_path=self.df1_path,
+                df2_path=self.df2_path,
+                chunksize=self.chunksize,
+                encoding=self.encoding,
+                separator=csv_separator,
+                agg_func=self.agg_func,
+                log_callback=lambda m, is_error=False: self.log_message.emit(m, is_error),
+                progress_callback=lambda fc, ft, gc, gt, fl: self.progress_chunk.emit(fc, ft, gc, gt, fl),
+            )
+
+            if self.use_chunked:
+                self.progress.emit("Загрузка данных в БД (чанками)...")
+                comparator.load_data()
+
+            # Проверка уникальности ключей
+            self.progress.emit("Проверка уникальности ключей...")
+            
+            # Для in-memory режима с агрегацией — проверяем уникальность ПОСЛЕ агрегации
+            # (агрегация выполняется внутри compare())
+            if not self.use_chunked and self.agg_func:
+                try:
+                    self.progress.emit("Выполнение сравнения (включая агрегацию)...")
+                    comparator.compare()
+                    
+                    # После агрегации проверяем уникальность на отагрегированных данных
+                    uniqueness_results, dup_samples = comparator.check_uniqueness()
+                    
+                    for table_name, result in uniqueness_results.items():
+                        if not result['unique']:
+                            msg = f"Обнаружены неуникальные ключи в {table_name}: {result['dup_keys']} ключей ({result['dup_rows']} строк)"
+                            self.key_uniqueness_warning.emit(msg, "")
+                            
+                            for sample_table, sample_df in dup_samples:
+                                if sample_table == table_name and not sample_df.empty:
+                                    self.duplicates_found.emit(table_name, sample_df)
+                except Exception as e:
+                    self.log_callback(f"  ⚠️ Ошибка сравнения/проверки уникальности: {e}")
+                    raise
+            else:
+                # Без агрегации (или чанковый режим) — проверяем до сравнения
+                try:
+                    uniqueness_results, dup_samples = comparator.check_uniqueness()
+                    
+                    for table_name, result in uniqueness_results.items():
+                        if not result['unique']:
+                            msg = f"Обнаружены неуникальные ключи в {table_name}: {result['dup_keys']} ключей ({result['dup_rows']} строк)"
+                            self.key_uniqueness_warning.emit(msg, "")
+                            
+                            for sample_table, sample_df in dup_samples:
+                                if sample_table == table_name and not sample_df.empty:
+                                    self.duplicates_found.emit(table_name, sample_df)
+                except Exception as e:
+                    self.log_callback(f"  ⚠️ Ошибка проверки уникальности: {e}")
+
+            self.progress.emit("Выполнение сравнения...")
+            if not self.use_chunked and self.agg_func:
+                # Уже выполнено выше
+                pass
+            elif self.use_chunked:
+                comparator.compare()
+            else:
+                comparator.compare()
+
+            self.progress.emit("Сравнение завершено!")
+            self.finished.emit(comparator)
+
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            if hasattr(comparator, 'close'):
+                comparator.close()
+
+
+# ============================================================
+# ГЛАВНОЕ ОКНО
+# ============================================================
+class HelpDialog(QDialog):
+    """Диалоговое окно справки (README)"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Справка")
+        self.resize(800, 600)
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowCloseButtonHint
+            | Qt.WindowMaximizeButtonHint
+        )
+
+        layout = QVBoxLayout(self)
+
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        self.browser.setFont(QFont("Segoe UI", 10))
+        self.browser.document().setDefaultStyleSheet("""
+            h1 { font-size: 22px; color: #1f4e79; margin-top: 12px; }
+            h2 { font-size: 18px; color: #2e75b6; margin-top: 10px; }
+            h3 { font-size: 15px; color: #2e75b6; }
+            p  { line-height: 1.4; }
+            code { background-color: #f3f3f3; font-family: Consolas, monospace; }
+            pre  { background-color: #f3f3f3; padding: 8px; }
+            a { color: #0563c1; }
+        """)
+        layout.addWidget(self.browser)
+
+        close_btn = QPushButton("Закрыть")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignRight)
+
+        self._load_readme()
+
+    def _load_readme(self):
+        readme_path = Path(__file__).parent / "README.md"
+        if not readme_path.exists():
+            self.browser.setPlainText(
+                f"Файл справки не найден:\n{readme_path}"
+            )
+            return
+        try:
+            text = readme_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = readme_path.read_text(encoding="cp1251")
+        except Exception as exc:
+            self.browser.setPlainText(f"Не удалось прочитать справку:\n{exc}")
+            return
+        self.browser.setMarkdown(text)
+        self.browser.setWindowFilePath(str(readme_path))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.comparator = None
+        self.df1 = None
+        self.df2 = None
+        self.current_schema = {}
+        self.current_compare_columns = []
+        self.output_dir = Path("./tmp/Results/compare_csv").resolve()
+        self.schema_manager = SchemaManager()
+        self.key_uniqueness_warnings = []
+        self.key_uniqueness_samples = []  # образцы дубликатов для отображения во вкладке
+        self.worker = None  # Сохраняем ссылку на worker для hotkeys и closeEvent
+        self.max_display_rows = 10000  # Лимит отображения строк в UI
+
+        self.init_ui()
+        self._load_schema_list()
+        self._load_last_session()
+        
+        # Если таблица схемы пуста (нет сессии), применяем первую схему
+        if self.schema_combo.currentIndex() == 0 and self.schema_table.rowCount() == 0:
+            self.apply_schema_template(self.schema_combo.currentText())
+
+    def init_ui(self):
+        """Инициализация интерфейса"""
+        self.setWindowTitle("Сравнение CSV файлов")
+        self.setMinimumSize(1400, 900)
+
+        self._create_menu()
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        top_panel = QWidget()
+        top_layout = QVBoxLayout(top_panel)
+
+        file_panel = self._create_file_panel()
+        file_panel.setMaximumHeight(250)  # Фиксированная высота панели файлов
+        top_layout.addWidget(file_panel)
+
+        settings_panel = self._create_settings_panel()
+        top_layout.addWidget(settings_panel)
+
+        main_layout.addWidget(top_panel)
+
+        splitter = QSplitter(Qt.Vertical)
+
+        self.log_panel = QTextEdit()
+        self.log_panel.setReadOnly(True)
+        self.log_panel.setMaximumHeight(150)
+        font = QFont("Courier New", 9)
+        self.log_panel.setFont(font)
+        splitter.addWidget(self.log_panel)
+
+        self.results_tabs = QTabWidget()
+        splitter.addWidget(self.results_tabs)
+
+        main_layout.addWidget(splitter)
+        
+        # Фиксируем размеры splitter'а: верхняя часть не должна менять размер
+        # 0 = верхняя панель (log_panel), 1 = нижняя панель (results_tabs)
+        splitter.setSizes([150, 10000])
+        splitter.setStretchFactor(0, 0)  # log_panel не растягивается
+        splitter.setStretchFactor(1, 1)  # results_tabs занимает всё остальное
+        
+        # Фиксируем размеры верхней панели
+        top_panel.setMaximumHeight(400)  # Максимальная высота верхней панели
+
+        self.status_bar = self.statusBar()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.hide()
+        self.status_bar.addPermanentWidget(self.progress_bar)
+
+        self._update_button_states()
+        
+        # Горячие клавиши
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        """Настройка горячих клавиш"""
+        # Ctrl+S — сохранить результаты
+        save_action = QAction(self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self._save_results)
+        self.addAction(save_action)
+        
+        # Ctrl+R — запустить сравнение
+        compare_action = QAction(self)
+        compare_action.setShortcut("Ctrl+R")
+        compare_action.triggered.connect(self._start_comparison)
+        self.addAction(compare_action)
+
+    def _create_menu(self):
+        """Создание меню"""
+        menubar = self.menuBar()
+        
+        # Меню Файл
+        file_menu = menubar.addMenu("Файл")
+        
+        # Выбор файла 1 (эталон)
+        select_file1_action = QAction("Выбрать файл 1 (эталон)...", self)
+        select_file1_action.setShortcut("Ctrl+O")
+        select_file1_action.triggered.connect(lambda: self._select_file(1))
+        file_menu.addAction(select_file1_action)
+        self.addAction(select_file1_action)  # Добавляем в окно для горячих клавиш
+        
+        # Выбор файла 2 (сравнение)
+        select_file2_action = QAction("Выбрать файл 2 (сравнение)...", self)
+        select_file2_action.setShortcut("Ctrl+Shift+O")
+        select_file2_action.triggered.connect(lambda: self._select_file(2))
+        file_menu.addAction(select_file2_action)
+        self.addAction(select_file2_action)  # Добавляем в окно для горячих клавиш
+        
+        file_menu.addSeparator()
+        
+        # Выбор каталога для результатов
+        set_output_dir_action = QAction("Выбрать каталог для результатов...", self)
+        set_output_dir_action.triggered.connect(self._select_output_dir)
+        file_menu.addAction(set_output_dir_action)
+        
+        file_menu.addSeparator()
+        
+        # Открыть файл схем
+        open_schemas_action = QAction("Открыть файл схем...", self)
+        open_schemas_action.triggered.connect(self._open_schemas_file)
+        file_menu.addAction(open_schemas_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("Выход", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # Меню Схемы
+        schemas_menu = menubar.addMenu("Схемы")
+        
+        add_schema_action = QAction("Создать новую схему...", self)
+        add_schema_action.triggered.connect(self._add_schema)
+        schemas_menu.addAction(add_schema_action)
+        
+        edit_schema_action = QAction("Редактировать текущую схему...", self)
+        edit_schema_action.triggered.connect(self._edit_current_schema)
+        schemas_menu.addAction(edit_schema_action)
+        
+        delete_schema_action = QAction("Удалить текущую схему", self)
+        delete_schema_action.triggered.connect(self._delete_current_schema)
+        schemas_menu.addAction(delete_schema_action)
+        
+        schemas_menu.addSeparator()
+        
+        reload_schemas_action = QAction("Перезагрузить схемы из файла", self)
+        reload_schemas_action.triggered.connect(self._reload_schemas)
+        schemas_menu.addAction(reload_schemas_action)
+        
+        # Меню Справка
+        help_menu = menubar.addMenu("Справка")
+        
+        open_readme_action = QAction("Открыть справку (README)", self)
+        open_readme_action.setShortcut("F1")
+        open_readme_action.triggered.connect(self._open_readme_in_vscode)
+        help_menu.addAction(open_readme_action)
+
+
+    def _create_file_panel(self) -> QGroupBox:
+        """Создание панели выбора файлов"""
+        group = QGroupBox("Выбор файлов для сравнения")
+        layout = QVBoxLayout(group)
+
+        # Файл 1 (эталон)
+        file1_layout = QHBoxLayout()
+        file1_layout.addWidget(QLabel("Файл 1 (эталон):"))
+        self.file1_path = QLineEdit()
+        self.file1_path.setPlaceholderText("Выберите CSV файл...")
+        file1_layout.addWidget(self.file1_path)
+        btn_file1 = QPushButton("Обзор...")
+        btn_file1.clicked.connect(lambda: self._select_file(1))
+        file1_layout.addWidget(btn_file1)
+        layout.addLayout(file1_layout)
+        
+        # Файл 2 (сравнение)
+        file2_layout = QHBoxLayout()
+        file2_layout.addWidget(QLabel("Файл 2 (сравнение):"))
+        self.file2_path = QLineEdit()
+        self.file2_path.setPlaceholderText("Выберите CSV файл...")
+        file2_layout.addWidget(self.file2_path)
+        btn_file2 = QPushButton("Обзор...")
+        btn_file2.clicked.connect(lambda: self._select_file(2))
+        file2_layout.addWidget(btn_file2)
+        layout.addLayout(file2_layout)
+        
+        # Каталог для результатов
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(QLabel("Каталог результатов:"))
+        self.output_path = QLineEdit(str(self.output_dir))
+        output_layout.addWidget(self.output_path)
+        btn_output = QPushButton("Обзор...")
+        btn_output.clicked.connect(self._select_output_dir)
+        output_layout.addWidget(btn_output)
+        layout.addLayout(output_layout)
+
+        # Разделитель CSV
+        sep_layout = QHBoxLayout()
+        sep_layout.addWidget(QLabel("Разделитель CSV:"))
+        self.sep_combo = QComboBox()
+        self.sep_combo.addItems([",", ";", "\t", "|"])
+        self.sep_combo.setCurrentText(",")
+        self.sep_combo.setEditable(True)  # Пользователь может ввести свой разделитель
+        sep_layout.addWidget(self.sep_combo)
+        
+        # Автоопределение разделителя
+        self.sep_auto_checkbox = QCheckBox("Авто")
+        self.sep_auto_checkbox.setChecked(False)
+        sep_layout.addWidget(self.sep_auto_checkbox)
+        
+        self.sep_auto_label = QLabel("")
+        self.sep_auto_label.setStyleSheet("color: #2196F3; font-weight: bold;")
+        self.sep_auto_label.setMaximumWidth(80)
+        sep_layout.addWidget(self.sep_auto_label)
+        
+        sep_layout.addStretch()
+        layout.addLayout(sep_layout)
+
+        return group
+
+    def _create_settings_panel(self) -> QGroupBox:
+        """Создание панели настроек с добавлением чанкового режима"""
+        group = QGroupBox("Настройки сравнения")
+        layout = QVBoxLayout(group)
+
+        # Верхняя панель: файл схем и справка
+        info_bar = QHBoxLayout()
+        self.schema_file_label = QLabel(f"Файл схем: {self.schema_manager.get_schema_file_path()}")
+        self.schema_file_label.setStyleSheet("color: #555; font-size: 10px;")
+        self.schema_file_label.setWordWrap(False)
+        info_bar.addWidget(self.schema_file_label)
+        info_bar.addStretch()
+        
+        btn_open_schema = QPushButton("📂 Открыть")
+        btn_open_schema.setMaximumWidth(80)
+        btn_open_schema.clicked.connect(self._open_schemas_file)
+        info_bar.addWidget(btn_open_schema)
+        
+        layout.addLayout(info_bar)
+
+        # Основная область: две колонки
+        content_layout = QHBoxLayout()
+
+        # Левая колонка: схема
+        schema_layout = QVBoxLayout()
+
+        # Выбор шаблона схемы
+        template_layout = QHBoxLayout()
+        template_layout.addWidget(QLabel("Шаблон схемы:"))
+        self.schema_combo = QComboBox()
+        self.schema_combo.currentTextChanged.connect(self.apply_schema_template)
+        template_layout.addWidget(self.schema_combo)
+
+        btn_add_schema = QPushButton("+")
+        btn_add_schema.setMaximumWidth(30)
+        btn_add_schema.clicked.connect(self._add_schema)
+        template_layout.addWidget(btn_add_schema)
+
+        btn_edit_schema = QPushButton("✏")
+        btn_edit_schema.setMaximumWidth(30)
+        btn_edit_schema.clicked.connect(self._edit_current_schema)
+        template_layout.addWidget(btn_edit_schema)
+
+        btn_delete_schema = QPushButton("✕")
+        btn_delete_schema.setMaximumWidth(30)
+        btn_delete_schema.clicked.connect(self._delete_current_schema)
+        template_layout.addWidget(btn_delete_schema)
+
+        schema_layout.addLayout(template_layout)
+
+        # Редактор схемы — таблица
+        schema_table_layout = QHBoxLayout()
+        schema_table_layout.addWidget(QLabel("Столбцы:"))
+        
+        self.schema_table = QTableWidget()
+        self.schema_table.setColumnCount(3)
+        self.schema_table.setHorizontalHeaderLabels(["Имя столбца", "Тип", "Ключевой"])
+        self.schema_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.schema_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.schema_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.schema_table.setMinimumHeight(150)
+        schema_table_layout.addWidget(self.schema_table)
+        
+        # Кнопки управления таблицей
+        table_buttons_layout = QVBoxLayout()
+        btn_add_col = QPushButton("+")
+        btn_add_col.setMaximumWidth(30)
+        btn_add_col.clicked.connect(self._add_schema_column)
+        table_buttons_layout.addWidget(btn_add_col)
+        
+        btn_remove_col = QPushButton("−")
+        btn_remove_col.setMaximumWidth(30)
+        btn_remove_col.clicked.connect(self._remove_schema_column)
+        table_buttons_layout.addWidget(btn_remove_col)
+        
+        btn_move_up = QPushButton("↑")
+        btn_move_up.setMaximumWidth(30)
+        btn_move_up.clicked.connect(lambda: self._move_schema_column(-1))
+        table_buttons_layout.addWidget(btn_move_up)
+        
+        btn_move_down = QPushButton("↓")
+        btn_move_down.setMaximumWidth(30)
+        btn_move_down.clicked.connect(lambda: self._move_schema_column(1))
+        table_buttons_layout.addWidget(btn_move_down)
+        
+        table_buttons_layout.addStretch()
+        schema_table_layout.addLayout(table_buttons_layout)
+        
+        schema_layout.addLayout(schema_table_layout)
+
+        # Кнопки для схемы
+        schema_buttons = QHBoxLayout()
+        btn_apply_schema = QPushButton("Применить схему")
+        btn_apply_schema.clicked.connect(self._apply_custom_schema)
+        schema_buttons.addWidget(btn_apply_schema)
+
+        btn_save_schema = QPushButton("Сохранить схему")
+        btn_save_schema.clicked.connect(self._save_current_schema)
+        schema_buttons.addWidget(btn_save_schema)
+
+        schema_layout.addLayout(schema_buttons)
+
+        # Обёртка QVBoxLayout в QWidget для QHBoxLayout
+        schema_widget = QWidget()
+        schema_widget.setLayout(schema_layout)
+        content_layout.addWidget(schema_widget)
+
+        # Правая колонка: параметры сравнения
+        params_layout = QVBoxLayout()
+
+        # Точность (без изменений)
+        tolerance_layout = QHBoxLayout()
+        tolerance_layout.addWidget(QLabel("Точность float:"))
+        self.tolerance_spin = QSpinBox()
+        self.tolerance_spin.setRange(0, 1000000)
+        self.tolerance_spin.setValue(0)
+        self.tolerance_spin.setSuffix(" (10⁻⁶)")
+        tolerance_layout.addWidget(self.tolerance_spin)
+        btn_set_tolerance_1 = QPushButton("0")
+        btn_set_tolerance_1.clicked.connect(lambda: self.tolerance_spin.setValue(0))
+        tolerance_layout.addWidget(btn_set_tolerance_1)
+        btn_set_tolerance_2 = QPushButton("0.0001")
+        btn_set_tolerance_2.clicked.connect(lambda: self.tolerance_spin.setValue(100))
+        tolerance_layout.addWidget(btn_set_tolerance_2)
+        btn_set_tolerance_3 = QPushButton("0.001")
+        btn_set_tolerance_3.clicked.connect(lambda: self.tolerance_spin.setValue(1000))
+        tolerance_layout.addWidget(btn_set_tolerance_3)
+        params_layout.addLayout(tolerance_layout)
+
+        # ----- НОВЫЙ БЛОК: РЕЖИМ ЭКОНОМИИ ПАМЯТИ (ЧАНКОВЫЙ) -----
+        memory_layout = QHBoxLayout()
+        self.chunked_checkbox = QCheckBox("Экономия памяти (чанковый режим)")
+        self.chunked_checkbox.setChecked(False)
+        memory_layout.addWidget(self.chunked_checkbox)
+
+        memory_layout.addWidget(QLabel("Размер чанка:"))
+        self.chunksize_spin = QSpinBox()
+        self.chunksize_spin.setRange(1000, 500000)
+        self.chunksize_spin.setValue(50000)
+        self.chunksize_spin.setSingleStep(10000)
+        memory_layout.addWidget(self.chunksize_spin)
+
+        params_layout.addLayout(memory_layout)
+        # ----- КОНЕЦ НОВОГО БЛОКА -----
+
+        # Агрегация дубликатов (без изменений)
+        agg_layout = QHBoxLayout()
+        self.agg_checkbox = QCheckBox("Агрегировать дубликаты по ключам")
+        self.agg_checkbox.setChecked(False)
+        agg_layout.addWidget(self.agg_checkbox)
+        self.agg_func_combo = QComboBox()
+        self.agg_func_combo.addItems(["sum", "mean", "min", "max"])
+        self.agg_func_combo.setCurrentText("sum")
+        agg_layout.addWidget(QLabel("Функция:"))
+        agg_layout.addWidget(self.agg_func_combo)
+        agg_layout.addStretch()
+        params_layout.addLayout(agg_layout)
+
+        # Кнопка проверки уникальности (без изменений)
+        check_uniqueness_btn = QPushButton("Проверить уникальность ключей")
+        check_uniqueness_btn.clicked.connect(self._check_key_uniqueness_manual)
+        check_uniqueness_btn.setStyleSheet("background-color: #9C27B0; color: white;")
+        params_layout.addWidget(check_uniqueness_btn)
+
+        params_layout.addWidget(QLabel(""))
+
+        # Кнопки управления (без изменений)
+        control_buttons = QVBoxLayout()
+        btn_load = QPushButton("1. Загрузить файлы")
+        btn_load.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        btn_load.setMaximumWidth(200)
+        btn_load.clicked.connect(self._load_files)
+        control_buttons.addWidget(btn_load)
+
+        self.btn_compare = QPushButton("2. Сравнить!")
+        self.btn_compare.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; font-size: 14px;")
+        self.btn_compare.setMaximumWidth(200)
+        self.btn_compare.clicked.connect(self._start_comparison)
+        control_buttons.addWidget(self.btn_compare)
+
+        self.btn_save = QPushButton("3. Сохранить результаты")
+        self.btn_save.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self.btn_save.setMaximumWidth(200)
+        self.btn_save.clicked.connect(self._save_results)
+        control_buttons.addWidget(self.btn_save)
+
+        btn_clear = QPushButton("Очистить все")
+        btn_clear.setMaximumWidth(200)
+        btn_clear.clicked.connect(self._clear_all)
+        control_buttons.addWidget(btn_clear)
+
+        params_layout.addLayout(control_buttons)
+
+        # Обёртка QVBoxLayout в QWidget для QHBoxLayout
+        params_widget = QWidget()
+        params_widget.setLayout(params_layout)
+        content_layout.addWidget(params_widget)
+
+        layout.addLayout(content_layout)
+
+        return group
+
+    @property
+    def current_tolerance(self) -> float:
+        """Единый источник правды для текущей точности сравнения"""
+        return self.tolerance_spin.value() / 1_000_000
+
+    def _add_schema_column(self):
+        """Добавление столбца в таблицу схемы"""
+        row = self.schema_table.rowCount()
+        self.schema_table.insertRow(row)
+        
+        name_item = QTableWidgetItem("")
+        name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+        self.schema_table.setItem(row, 0, name_item)
+        
+        type_combo = QComboBox()
+        type_combo.addItems(["string", "float", "int", "bool"])
+        type_combo.setCurrentText("string")
+        self.schema_table.setCellWidget(row, 1, type_combo)
+        
+        key_checkbox = QCheckBox()
+        key_checkbox.setChecked(False)
+        key_widget = QWidget()
+        key_layout = QHBoxLayout(key_widget)
+        key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+        key_layout.addWidget(key_checkbox)
+        key_layout.setContentsMargins(0, 0, 0, 0)
+        self.schema_table.setCellWidget(row, 2, key_widget)
+    
+    def _remove_schema_column(self):
+        """Удаление выбранного столбца из таблицы схемы"""
+        current_row = self.schema_table.currentRow()
+        if current_row >= 0:
+            self.schema_table.removeRow(current_row)
+    
+    def _move_schema_column(self, direction: int):
+        """Перемещение столбца вверх или вниз"""
+        current_row = self.schema_table.currentRow()
+        new_row = current_row + direction
+        
+        if new_row < 0 or new_row >= self.schema_table.rowCount():
+            return
+        
+        row_data = []
+        for col in range(3):
+            item = self.schema_table.item(current_row, col)
+            if item:
+                row_data.append(item.text())
+            else:
+                widget = self.schema_table.cellWidget(current_row, col)
+                if widget:
+                    if col == 1:
+                        row_data.append(widget.currentText())
+                    elif col == 2:
+                        row_data.append(widget.findChild(QCheckBox).isChecked())
+                else:
+                    row_data.append("")
+        
+        self.schema_table.removeRow(current_row)
+        self.schema_table.insertRow(new_row)
+        
+        for col in range(3):
+            if col == 0:
+                name_item = QTableWidgetItem(row_data[col])
+                name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+                self.schema_table.setItem(new_row, col, name_item)
+            elif col == 1:
+                type_combo = QComboBox()
+                type_combo.addItems(["string", "float", "int", "bool"])
+                type_combo.setCurrentText(row_data[col])
+                self.schema_table.setCellWidget(new_row, col, type_combo)
+            elif col == 2:
+                key_checkbox = QCheckBox()
+                key_checkbox.setChecked(row_data[col])
+                key_widget = QWidget()
+                key_layout = QHBoxLayout(key_widget)
+                key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+                key_layout.addWidget(key_checkbox)
+                key_layout.setContentsMargins(0, 0, 0, 0)
+                self.schema_table.setCellWidget(new_row, col, key_widget)
+        
+        self.schema_table.setCurrentCell(new_row, 0)
+    
+    def _get_schema_from_table(self) -> Dict[str, str]:
+        """Получение схемы из таблицы"""
+        schema = {}
+        for row in range(self.schema_table.rowCount()):
+            name_item = self.schema_table.item(row, 0)
+            if not name_item or not name_item.text().strip():
+                continue
+            
+            type_combo = self.schema_table.cellWidget(row, 1)
+            col_type = type_combo.currentText() if type_combo else "string"
+            
+            schema[name_item.text().strip()] = col_type
+        
+        return schema
+    
+    def _get_key_columns_from_table(self) -> List[str]:
+        """Получение ключевых столбцов из таблицы"""
+        key_columns = []
+        for row in range(self.schema_table.rowCount()):
+            key_widget = self.schema_table.cellWidget(row, 2)
+            if key_widget:
+                checkbox = key_widget.findChild(QCheckBox)
+                if checkbox and checkbox.isChecked():
+                    name_item = self.schema_table.item(row, 0)
+                    if name_item and name_item.text().strip():
+                        key_columns.append(name_item.text().strip())
+        return key_columns
+    
+    def _set_schema_to_table(self, schema: Dict[str, str], key_columns: List[str] = None):
+        """Установка схемы в таблицу"""
+        self.schema_table.setRowCount(0)
+        
+        for col_name, col_type in schema.items():
+            row = self.schema_table.rowCount()
+            self.schema_table.insertRow(row)
+            
+            name_item = QTableWidgetItem(col_name)
+            name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
+            self.schema_table.setItem(row, 0, name_item)
+            
+            type_combo = QComboBox()
+            type_combo.addItems(["string", "float", "int", "bool"])
+            type_combo.setCurrentText(col_type)
+            self.schema_table.setCellWidget(row, 1, type_combo)
+            
+            is_key = key_columns and col_name in key_columns
+            key_checkbox = QCheckBox()
+            key_checkbox.setChecked(is_key)
+            key_widget = QWidget()
+            key_layout = QHBoxLayout(key_widget)
+            key_layout.setAlignment(key_checkbox, Qt.AlignCenter)
+            key_layout.addWidget(key_checkbox)
+            key_layout.setContentsMargins(0, 0, 0, 0)
+            self.schema_table.setCellWidget(row, 2, key_widget)
+
+    def _check_key_uniqueness_manual(self):
+        """Ручная проверка уникальности ключей"""
+        QApplication.processEvents()  # Обновляем UI перед длительной операцией
+        
+        key_columns = self._get_key_columns_from_table()
+        if not key_columns:
+            QMessageBox.warning(self, "Предупреждение", "Ключевые столбцы не указаны в таблице схемы!")
+            return
+        
+        use_chunked = self.chunked_checkbox.isChecked()
+        
+        if use_chunked:
+            # Чанковый режим: создаём временный comparator для проверки
+            self._check_uniqueness_chunked(key_columns)
+        else:
+            # In-memory режим: используем загруженные датафреймы
+            if self.df1 is None or self.df2 is None:
+                QMessageBox.warning(self, "Предупреждение", "Сначала загрузите файлы!")
+                return
+            self._check_uniqueness_in_memory(key_columns)
+
+    def _check_uniqueness_in_memory(self, key_columns: List[str]):
+        """Проверка уникальности для загруженных в память датафреймов"""
+        # Создаём временный comparator для вызова check_uniqueness()
+        from data_frame_comparator import InMemoryComparator
+        tmp_comparator = InMemoryComparator(
+            self.df1, self.df2,
+            schema_default=self.current_schema,
+            compare_columns=key_columns,
+            log_callback=lambda m, is_error=False: self.log(m, is_error=is_error)
+        )
+        results, dup_samples = tmp_comparator.check_uniqueness()
+        
+        has_warnings = False
+        for table_name, result in results.items():
+            if not result['unique']:
+                has_warnings = True
+                self.log(f"⚠️ В {table_name} обнаружено {result['dup_keys']} неуникальных ключей ({result['dup_rows']} строк)", is_error=True)
+                for sample_table, sample_df in dup_samples:
+                    if sample_table == table_name and not sample_df.empty:
+                        self._show_duplicates_table(sample_df, f"Дубликаты в {table_name}")
+
+    def _check_uniqueness_chunked(self, key_columns: List[str]):
+        """Проверка уникальности ключей напрямую из CSV-файлов через SQLite (чанки)"""
+        path1 = self.file1_path.text().strip()
+        path2 = self.file2_path.text().strip()
+        
+        if not path1 or not path2:
+            QMessageBox.warning(self, "Предупреждение", "Укажите пути к обоим файлам!")
+            return
+        if not os.path.exists(path1):
+            QMessageBox.critical(self, "Ошибка", f"Файл не найден: {path1}")
+            return
+        if not os.path.exists(path2):
+            QMessageBox.critical(self, "Ошибка", f"Файл не найден: {path2}")
+            return
+        
+        # Определяем разделитель
+        sep = self.sep_combo.currentText()
+        if self.sep_auto_checkbox.isChecked():
+            sep = self._auto_detect_separator(path1) or ","
+        
+        self.log("Загрузка файлов для проверки уникальности...")
+        QApplication.processEvents()
+        
+        # Создаём временный comparator для проверки уникальности
+        from data_frame_comparator import create_comparator
+        comparator = create_comparator(
+            None, None,
+            key_columns,
+            self.current_schema,
+            use_chunked=True,
+            df1_path=path1,
+            df2_path=path2,
+            separator=sep,
+            log_callback=lambda m, is_error=False: self.log(m, is_error=is_error),
+            progress_callback=lambda fc, ft, gc, gt, fl: self._on_progress_chunk(fc, ft, gc, gt, fl)
+        )
+        try:
+            # Загружаем файлы чанками с прогрессом
+            self.log("  Загрузка файла 1...")
+            QApplication.processEvents()
+            comparator._load_file(path1, 'df1', file_label='Файл 1',
+                                  file_total_chunks=comparator._count_chunks(path1, list(self.current_schema.keys())),
+                                  cumulative_offset=0, cumulative_total=comparator._count_chunks(path1, list(self.current_schema.keys())) + comparator._count_chunks(path2, list(self.current_schema.keys())))
+            
+            self.log("  Загрузка файла 2...")
+            QApplication.processEvents()
+            comparator._load_file(path2, 'df2', file_label='Файл 2',
+                                  file_total_chunks=comparator._count_chunks(path2, list(self.current_schema.keys())),
+                                  cumulative_offset=comparator._count_chunks(path1, list(self.current_schema.keys())),
+                                  cumulative_total=comparator._count_chunks(path1, list(self.current_schema.keys())) + comparator._count_chunks(path2, list(self.current_schema.keys())))
+            
+            # Проверяем уникальность
+            results, dup_samples = comparator.check_uniqueness()
+            
+            has_warnings = False
+            for table_name, result in results.items():
+                if not result['unique']:
+                    has_warnings = True
+                    self.log(f"⚠️ В {table_name} обнаружено {result['dup_keys']} неуникальных ключей ({result['dup_rows']} строк)", is_error=True)
+                    for sample_table, sample_df in dup_samples:
+                        if sample_table == table_name and not sample_df.empty:
+                            self._show_duplicates_table(sample_df, f"Дубликаты в {table_name}")
+            
+            if has_warnings:
+                QMessageBox.information(self, "Уникальность ключей", "Проверка завершена. Результаты в логе.")
+            else:
+                QMessageBox.information(self, "Уникальность ключей", "Ключи уникальны в обоих файлах!")
+        finally:
+            comparator.close()
+
+    def _show_duplicates_table(self, duplicates_df: pd.DataFrame, title: str):
+        """Отображение таблицы с дубликатами"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # Информация
+        info_label = QLabel(f"{title}: {len(duplicates_df)} строк с дубликатами")
+        info_label.setStyleSheet("font-weight: bold; color: red; padding: 5px;")
+        layout.addWidget(info_label)
+        
+        # Таблица
+        table = QTableWidget()
+        table.setColumnCount(len(duplicates_df.columns))
+        table.setHorizontalHeaderLabels(duplicates_df.columns.tolist())
+        table.setRowCount(len(duplicates_df))
+        
+        for row_idx, (_, row) in enumerate(duplicates_df.iterrows()):
+            for col_idx, col_name in enumerate(duplicates_df.columns):
+                value = str(row[col_name]) if pd.notna(row[col_name]) else ""
+                item = QTableWidgetItem(value)
+                
+                # Подсвечиваем дублирующиеся строки
+                if '_count' in col_name or '_total' in col_name:
+                    item.setBackground(Qt.yellow)
+                
+                table.setItem(row_idx, col_idx, item)
+        
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setStretchLastSection(True)
+        
+        layout.addWidget(table)
+        
+        # Кнопка "Копировать в буфер"
+        copy_btn = QPushButton("📋 Копировать в буфер")
+        copy_btn.clicked.connect(lambda: self._copy_to_clipboard(duplicates_df))
+        layout.addWidget(copy_btn)
+        
+        # Добавляем вкладку с дубликатами
+        self.results_tabs.addTab(widget, f"⚠ {title}")
+        self.results_tabs.setCurrentWidget(widget)
+        
+    # ---- МЕТОДЫ ОБРАБОТКИ ДЕЙСТВИЙ ----
+
+    def _load_schema_list(self):
+        """Загрузка списка схем в комбобокс"""
+        self.schema_combo.blockSignals(True)   # отключаем сигналы
+        self.schema_combo.clear()
+        schema_names = self.schema_manager.get_schema_names()
+        self.schema_combo.addItems(schema_names)
+        
+        # Если ничего не выбрано и есть схемы — выбираем первую
+        if schema_names and self.schema_combo.currentIndex() == -1:
+            self.schema_combo.setCurrentIndex(0)
+        
+        self.schema_combo.blockSignals(False)  # включаем обратно
+
+
+    def _open_schemas_file(self):
+        """Открытие файла схем в системном редакторе"""
+        schema_file = self.schema_manager.get_schema_file_path()
+        if os.path.exists(schema_file):
+            try:
+                if sys.platform == 'win32':
+                    os.startfile(schema_file)
+                elif sys.platform == 'darwin':
+                    os.system(f'open "{schema_file}"')
+                else:
+                    os.system(f'xdg-open "{schema_file}"')
+                self.log(f"Открыт файл схем: {schema_file}")
+            except Exception as e:
+                self.log(f"Ошибка открытия файла: {e}", is_error=True)
+                QMessageBox.warning(self, "Ошибка", f"Не удалось открыть файл: {e}")
+        else:
+            QMessageBox.warning(self, "Предупреждение", f"Файл схем не найден: {schema_file}")
+    
+    def _open_readme_in_vscode(self):
+        """Открытие справки в диалоговом окне"""
+        if not Path(__file__).parent.joinpath("README.md").exists():
+            QMessageBox.warning(self, "Предупреждение", f"Файл справки не найден: README.md")
+            return
+        if not hasattr(self, '_help_dialog') or self._help_dialog is None:
+            self._help_dialog = HelpDialog(self)
+            self._help_dialog.finished.connect(lambda: setattr(self, "_help_dialog", None))
+        self._help_dialog.show()
+        self._help_dialog.raise_()
+        self._help_dialog.activateWindow()
+
+
+    def apply_schema_template(self, schema_name: str):
+        """Применение шаблона схемы"""
+        if not schema_name:
+            return
+            
+        schema_data = self.schema_manager.get_schema(schema_name)
+        if not schema_data:
+            return
+        
+        self.current_schema = schema_data.get('schema', {}).copy()
+        self.current_compare_columns = schema_data.get('key_columns', []).copy()
+        
+        # Отображаем схему в таблице
+        self._set_schema_to_table(self.current_schema, self.current_compare_columns)
+        
+        # Устанавливаем точность из схемы
+        tolerance_value = int(schema_data.get('tolerance', 0.0) * 1000000)
+        self.tolerance_spin.setValue(tolerance_value)
+        
+        self.log(f"Применена схема: {schema_name} (точность: {self.current_tolerance})")
+    
+
+    def _apply_custom_schema(self):
+        """Применение пользовательской схемы из таблицы"""
+        try:
+            schema = self._get_schema_from_table()
+            
+            if not schema:
+                QMessageBox.warning(self, "Предупреждение", "Схема пуста!")
+                return
+            
+            self.current_schema = schema
+            self.current_compare_columns = self._get_key_columns_from_table()
+            
+            self.log(f"Применена пользовательская схема ({len(schema)} столбцов, точность: {self.current_tolerance})")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка в схеме: {e}")
+            self.log(f"Ошибка схемы: {e}", is_error=True)
+   
+    def _save_current_schema(self):
+        """Сохранение текущей схемы в файл JSON"""
+        try:
+            schema = self._get_schema_from_table()
+            
+            if not schema:
+                QMessageBox.warning(self, "Предупреждение", "Схема пуста!")
+                return
+            
+            key_columns = self._get_key_columns_from_table()
+            tolerance = self.current_tolerance
+            
+            schema_name = self.schema_combo.currentText()
+            
+            if schema_name:
+                self.schema_manager.update_schema(
+                    schema_name, schema_name, schema, key_columns, tolerance
+                )
+                self.log(f"Схема обновлена: {schema_name} (точность: {tolerance})")
+            else:
+                reply = QMessageBox.question(
+                    self, "Новая схема",
+                    "Хотите создать новую схему?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    self._add_schema()
+            
+            current_schema = self.schema_combo.currentText()
+            self._load_schema_list()
+            if current_schema:
+                self.schema_combo.setCurrentText(current_schema)
+            
+            QMessageBox.information(
+                self, "Успех",
+                f"Схема сохранена в файл:\n{self.schema_manager.get_schema_file_path()}"
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+    
+
+    def _add_schema(self):
+        """Добавление новой схемы"""
+        schema = self._get_schema_from_table()
+        key_columns = self._get_key_columns_from_table()
+        tolerance = self.current_tolerance
+        
+        if not schema:
+            QMessageBox.warning(self, "Предупреждение", "Схема пуста! Добавьте столбцы.")
+            return
+        
+        schema_data = {
+            'schema': schema,
+            'key_columns': key_columns,
+            'tolerance': tolerance
+        }
+        
+        dialog = SchemaEditorDialog(
+            self.schema_manager,
+            schema_name="",
+            schema_data=schema_data,
+            parent=self
+        )
+        
+        if dialog.exec() == QDialog.Accepted:
+            result = dialog.result
+            if result:
+                self.schema_manager.add_schema(
+                    result['name'],
+                    result['schema'],
+                    result['key_columns'],
+                    result.get('tolerance', 0.0)
+                )
+                self._load_schema_list()
+                self.schema_combo.setCurrentText(result['name'])
+                self.apply_schema_template(result['name'])
+                self.log(f"Создана новая схема: {result['name']}")
+                QMessageBox.information(
+                    self, "Успех",
+                    f"Схема '{result['name']}' сохранена в файл:\n"
+                    f"{self.schema_manager.get_schema_file_path()}"
+                )
+    
+
+    def _edit_current_schema(self):
+        """Редактирование текущей схемы — загружает в таблицу"""
+        schema_name = self.schema_combo.currentText()
+        if not schema_name:
+            QMessageBox.warning(self, "Предупреждение", "Выберите схему для редактирования!")
+            return
+        
+        schema_data = self.schema_manager.get_schema(schema_name)
+        if not schema_data:
+            return
+        
+        # Загружаем схему в таблицу для редактирования
+        schema = schema_data.get('schema', {})
+        key_columns = schema_data.get('key_columns', [])
+        tolerance = schema_data.get('tolerance', 0.0)
+        
+        self._set_schema_to_table(schema, key_columns)
+        self.tolerance_spin.setValue(int(tolerance * 1_000_000))
+        
+        self.log(f"Схема '{schema_name}' загружена в таблицу для редактирования")
+        QMessageBox.information(
+            self, "Редактирование",
+            f"Схема '{schema_name}' загружена в таблицу.\n"
+            f"Отредактируйте столбцы и нажмите 'Сохранить схему'."
+        )
+  
+
+    def _delete_current_schema(self):
+        """Удаление текущей схемы"""
+        schema_name = self.schema_combo.currentText()
+        if not schema_name:
+            QMessageBox.warning(self, "Предупреждение", "Выберите схему для удаления!")
+            return
+        
+        reply = QMessageBox.question(
+            self, "Подтверждение",
+            f"Удалить схему '{schema_name}' из файла {self.schema_manager.get_schema_file_path()}?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            if self.schema_manager.delete_schema(schema_name):
+                self._load_schema_list()
+                self.log(f"Схема удалена: {schema_name}")
+   
+
+    def _reload_schemas(self):
+        """Перезагрузка схем из файла"""
+        self.schema_manager.load_schemas()
+        self._load_schema_list()
+        self.log("Схемы перезагружены из файла")
+    
+    def _select_file(self, file_num: int):
+        """Выбор CSV файла"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Выберите файл {file_num}",
+            "",
+            "CSV файлы (*.csv);;Все файлы (*)"
+        )
+        
+        if file_path:
+            if file_num == 1:
+                self.file1_path.setText(file_path)
+            else:
+                self.file2_path.setText(file_path)
+            
+            self.log(f"Выбран файл {file_num}: {file_path}")
+            
+            # Автоопределение разделителя
+            if self.sep_auto_checkbox.isChecked():
+                self._auto_detect_separator(file_path)
+            
+            self._update_button_states()
+    
+    def _auto_detect_separator(self, file_path: str) -> str:
+        """
+        Автоопределение разделителя CSV файла.
+        Возвращает обнаруженный разделитель или пустую строку при ошибке.
+        """
+        try:
+            best_sep = auto_detect_separator(file_path, 'utf-8')
+            
+            # Если лучший разделитель встречается менее 3 раз — считаем что разделитель не определён
+            if best_sep == ',':
+                # auto_detect_separator вернёт ',' по умолчанию — проверим,
+                # что файл действительно содержит разделитель
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    sample = f.read(8192)
+                if sample.count(',') < 3 and sample.count(';') < 3 and sample.count('\t') < 3 and sample.count('|') < 3:
+                    self.sep_auto_label.setText("—")
+                    return ""
+            
+            # Отображаем обнаруженный разделитель
+            sep_display = {',': ',', ';': ';', '\t': 'TAB', '|': '|'}
+            self.sep_auto_label.setText(f"{sep_display.get(best_sep, best_sep)}")
+            
+            # Устанавливаем в комбобокс
+            self.sep_combo.setCurrentText(best_sep)
+            
+            return best_sep
+            
+        except Exception as e:
+            self.sep_auto_label.setText("ERR")
+            return ""
+    
+    def _select_output_dir(self):
+        """Выбор каталога для результатов"""
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Выберите каталог для результатов", str(self.output_dir)
+        )
+        
+        if dir_path:
+            self.output_dir = Path(dir_path).resolve()
+            self.output_path.setText(str(self.output_dir))
+            self.log(f"Каталог результатов: {self.output_dir}")
+  
+    # ИЗМЕНЕНО: загрузка файлов с учётом чанкового режима
+    def _load_files(self):
+        """Загрузка файлов (в память или только проверка путей)"""
+        path1 = self.file1_path.text()
+        path2 = self.file2_path.text()
+
+        if not path1 or not path2:
+            QMessageBox.warning(self, "Предупреждение", "Выберите оба файла!")
+            return
+
+        if not os.path.exists(path1):
+            QMessageBox.critical(self, "Ошибка", f"Файл не найден: {path1}")
+            return
+        if not os.path.exists(path2):
+            QMessageBox.critical(self, "Ошибка", f"Файл не найден: {path2}")
+            return
+        if not self.current_schema:
+            self.apply_schema_template(self.schema_combo.currentText())
+            
+        # Обновляем каталог результатов
+        output_path = self.output_path.text().strip()
+        if output_path:
+            self.output_dir = Path(output_path).resolve()
+
+        # Если включён чанковый режим – не загружаем данные в память
+        if self.chunked_checkbox.isChecked():
+            self.df1 = None
+            self.df2 = None
+            self.log("Чанковый режим: файлы не загружены в память, будут читаться по частям.")
+            self._update_button_states()
+            return
+
+        # Автоопределение разделителя перед загрузкой (если включено)
+        if self.sep_auto_checkbox.isChecked():
+            self.log("Автоопределение разделителя перед загрузкой...")
+            sep = self._auto_detect_separator(path1)
+            if not sep:
+                # Fallback: пробуем определить по второму файлу
+                sep = self._auto_detect_separator(path2)
+            if sep:
+                self.log(f"  Разделитель определён: '{sep}'")
+            else:
+                self.log("  Не удалось определить разделитель, используем ','")
+                sep = ","
+        else:
+            sep = self.sep_combo.currentText()
+        # Иначе загружаем как обычно
+        try:
+            self.log(f"Загрузка файла 1: {path1}")
+            self.df1 = read_csv_with_schema_v1(path1, type_mapping=self.current_schema, sep=sep)
+            self.log(f"  ✓ Загружено: {len(self.df1)} строк, {len(self.df1.columns)} столбцов")
+            self.log(f"  Столбцы: {', '.join(self.df1.columns[:5])}{'...' if len(self.df1.columns) > 5 else ''}")
+            
+            # Предпросмотр первых 3 строк
+            if len(self.df1) > 0:
+                self.log(f"  Первые строки:")
+                for idx, row in self.df1.head(3).iterrows():
+                    preview = ', '.join(f"{col}={row[col]}" for col in list(self.df1.columns)[:4])
+                    self.log(f"    [{idx}] {preview}{'...' if len(self.df1.columns) > 4 else ''}")
+
+            self.log(f"Загрузка файла 2: {path2}")
+            self.df2 = read_csv_with_schema_v1(path2, type_mapping=self.current_schema, sep=sep)
+            self.log(f"  ✓ Загружено: {len(self.df2)} строк, {len(self.df2.columns)} столбцов")
+            self.log(f"  Столбцы: {', '.join(self.df2.columns[:5])}{'...' if len(self.df2.columns) > 5 else ''}")
+            
+            # Предпросмотр первых 3 строк
+            if len(self.df2) > 0:
+                self.log(f"  Первые строки:")
+                for idx, row in self.df2.head(3).iterrows():
+                    preview = ', '.join(f"{col}={row[col]}" for col in list(self.df2.columns)[:4])
+                    self.log(f"    [{idx}] {preview}{'...' if len(self.df2.columns) > 4 else ''}")
+
+            self._update_button_states()
+            self.log("Файлы успешно загружены!")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка загрузки", str(e))
+            self.log(f"Ошибка загрузки: {e}", is_error=True)
+
+    # ИЗМЕНЕНО: запуск сравнения с передачей параметров чанкового режима
+    def _start_comparison(self):
+        """Запуск сравнения с возможной агрегацией дубликатов и чанковым режимом"""
+        if not self.chunked_checkbox.isChecked() and (self.df1 is None or self.df2 is None):
+            QMessageBox.warning(self, "Предупреждение", "Сначала загрузите файлы!")
+            return
+
+
+        # Освобождаем временные файлы предыдущего компаратора
+        if self.comparator is not None:
+            try:
+                if hasattr(self.comparator, 'cleanup'):
+                    self.comparator.cleanup()
+                elif hasattr(self.comparator, 'close'):
+                    self.comparator.close()
+            except Exception as e:
+                self.log(f"Не удалось освободить предыдущий компаратор: {e}", is_error=True)
+            self.comparator = None
+
+        # ВАЖНО: перечитываем схему и ключи из таблицы на каждом запуске.
+        # Иначе пользователь редактирует таблицу, но сравнение идёт по схеме,
+        # сохранённой в последний apply_schema_template.
+        self.current_schema = self._get_schema_from_table()
+        self.current_compare_columns = self._get_key_columns_from_table()
+
+        if not self.current_compare_columns:
+            QMessageBox.warning(self, "Предупреждение", "Укажите ключевые столбцы!")
+            return
+
+        for col in self.current_compare_columns:
+            if col not in self.current_schema:
+                QMessageBox.critical(
+                    self, "Ошибка",
+                    f"Столбец '{col}' не найден в схеме!\n"
+                    f"Доступные столбцы: {', '.join(self.current_schema.keys())}"
+                )
+                return
+
+        tolerance = self.current_tolerance
+
+        # --- АГРЕГАЦИЯ (если включена) ---
+        # Агрегация выполняется внутри компаратора (InMemoryComparator или ChunkedComparator)
+
+        if self.agg_checkbox.isChecked():
+            agg_func = self.agg_func_combo.currentText()
+            self.log("Агрегация дубликатов включена (функция: {})".format(agg_func))
+
+            if self.chunked_checkbox.isChecked():
+                # В чанковом режиме агрегация выполняется внутри ChunkedComparator
+                self.log("  Агрегация будет выполнена в чанковом режиме после загрузки")
+            else:
+                # В in-memory режиме агрегация выполняется внутри InMemoryComparator
+                self.log("  Агрегация будет выполнена в in-memory режиме перед сравнением")
+
+    
+        # --- КОНЕЦ АГРЕГАЦИИ ---
+
+        self.key_uniqueness_warnings = []
+        self.key_uniqueness_samples = []
+
+        # Настройка UI
+        self.progress_bar.show()
+        self.progress_bar.setRange(0, 0)
+        self.btn_compare.setEnabled(False)
+        self.btn_save.setEnabled(False)
+
+        self.log(f"\n{'='*60}")
+        self.log(f"Запуск сравнения...")
+        self.log(f"Схема: {self.schema_combo.currentText()}")
+        self.log(f"Точность: {tolerance}")
+        self.log(f"Ключевые столбцы: {', '.join(self.current_compare_columns)}")
+        if self.chunked_checkbox.isChecked():
+            self.log(f"Режим: чанковый (размер чанка: {self.chunksize_spin.value()})")
+        else:
+            self.log(f"Режим: in-memory")
+        self.log(f"{'='*60}")
+
+        # Определяем, что передавать в worker
+        use_chunked = self.chunked_checkbox.isChecked()
+        if use_chunked:
+            # В чанковом режиме передаём пути к файлам, а не DataFrame
+            df1_worker = None
+            df2_worker = None
+            df1_path = self.file1_path.text()
+            df2_path = self.file2_path.text()
+        else:
+            df1_worker = self.df1
+            df2_worker = self.df2
+            df1_path = None
+            df2_path = None
+        sep = self.sep_combo.currentText()
+        agg_func = self.agg_func_combo.currentText() if self.agg_checkbox.isChecked() else None
+        self.worker = CompareWorker(
+            df1_worker, df2_worker,
+            self.current_schema,
+            self.current_compare_columns,
+            tolerance,
+            use_chunked=use_chunked,
+            df1_path=df1_path,
+            df2_path=df2_path,
+            chunksize=self.chunksize_spin.value(),
+            encoding='utf-8',
+            csv_separator=sep,
+            agg_func=agg_func,
+            log_callback=self.log  # передаём метод log для вывода в UI
+        )
+        self.worker.progress.connect(self.log)
+        self.worker.log_message.connect(self.log)
+        self.worker.finished.connect(self._on_comparison_finished)
+        self.worker.error.connect(self._on_comparison_error)
+        self.worker.key_uniqueness_warning.connect(self._on_key_uniqueness_warning)
+        self.worker.progress_chunk.connect(self._on_chunk_progress)
+        self.worker.duplicates_found.connect(self._on_duplicates_found)
+        self.worker.start()
+    
+    def _on_chunk_progress(self, file_current: int, file_total: int,
+                           global_current: int, global_total: int, file_label: str):
+        """Обработка прогресса чанковой загрузки"""
+        if file_total > 0:
+            file_percent = int(file_current / file_total * 100)
+            self.log(f"  {file_label}: {file_current}/{file_total} чанков ({file_percent}%)")
+        if global_total > 0:
+            global_percent = int(global_current / global_total * 100)
+            self.progress_bar.setValue(global_percent)
+    
+    def _on_progress_chunk(self, file_current: int, file_total: int,
+                           global_current: int, global_total: int, file_label: str):
+        """Обработка прогресса чанковой загрузки (для ручной проверки уникальности)"""
+        if file_total > 0:
+            file_percent = int(file_current / file_total * 100)
+            self.log(f"  {file_label}: {file_current}/{file_total} чанков ({file_percent}%)")
+            QApplication.processEvents()
+
+    def _on_key_uniqueness_warning(self, message: str, details: str):
+        """Обработка предупреждения о неуникальных ключах (неблокирующая)"""
+        self.key_uniqueness_warnings.append((message, details))
+        self.log(f"⚠️ {message}", is_error=False)
+        # Не показываем диалог здесь — он будет показан после завершения сравнения
+        # Это предотвращает deadlock при вызове из потока
+
+    def _on_duplicates_found(self, table_name: str, sample_df: pd.DataFrame):
+        """Обработка найденных дубликатов из чанкового режима"""
+        # Сохраняем образцы для отображения во вкладке предупреждений
+        self.key_uniqueness_samples.append((table_name, sample_df))
+        # Показываем дубликаты в вкладке результатов
+        self._show_duplicates_table(sample_df, f"Дубликаты в {table_name}")
+    
+    def _on_comparison_finished(self, comparator):
+        """Обработка завершения сравнения"""
+        self.comparator = comparator
+        self.progress_bar.hide()
+        self.btn_compare.setEnabled(True)
+        self.btn_save.setEnabled(True)
+        self._display_results()
+
+        # Показываем предупреждения об уникальности (если были)
+        # При включённой агрегации popup не показываем — дубликаты будут агрегированы
+        if self.key_uniqueness_warnings and not self.agg_checkbox.isChecked():
+            warning_text = "\n\n".join([msg for msg, _ in self.key_uniqueness_warnings])
+            reply = QMessageBox.warning(
+                self, "Предупреждение о неуникальных ключах",
+                f"Обнаружены неуникальные ключи:\n\n{warning_text}\n\n"
+                f"Сравнение будет продолжено, но результаты могут быть некорректными.\n\n"
+                f"Хотите просмотреть детали дубликатов?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                # Показываем все вкладки с дубликатами (они уже добавлены через _on_duplicates_found)
+                pass  # Вкладки с дубликатами уже добавлены в results_tabs
+
+        # Для чанкового режима используем реальные totals, а не len(df) (который усечён)
+        is_chunked = hasattr(comparator, '_total_only1')
+        
+        total_df1_only = getattr(comparator, '_total_only1', len(comparator.df1_only)) if is_chunked else len(comparator.df1_only)
+        total_df2_only = getattr(comparator, '_total_only2', len(comparator.df2_only)) if is_chunked else len(comparator.df2_only)
+        total_diff = getattr(comparator, '_total_diff', len(comparator.df1_df2_value) if comparator.df1_df2_value is not None else 0) if is_chunked else (len(comparator.df1_df2_value) if comparator.df1_df2_value is not None else 0)
+        
+        total_diffs = total_df1_only + total_df2_only + total_diff
+
+        message_parts = []
+        if self.key_uniqueness_warnings:
+            message_parts.append("⚠️ ВНИМАНИЕ: Обнаружены неуникальные ключи!")
+            message_parts.append(f"   Количество предупреждений: {len(self.key_uniqueness_warnings)}")
+            message_parts.append("")
+
+        if total_diffs == 0:
+            message_parts.append("✓ Нет отличий! DataFrame идентичны.")
+            self.log("\n✓ Нет отличий! DataFrame идентичны.")
+            QMessageBox.information(self, "Результат", "\n".join(message_parts))
+        else:
+            message_parts.append(f"✓ Найдено отличий: {total_diffs}")
+            self.log(f"\n✓ Найдено отличий: {total_diffs}")
+            QMessageBox.information(
+                self, "Результат",
+                "\n".join(message_parts) +
+                f"\n\nСравнение завершено!\n"
+                f"Найдено отличий: {total_diffs}\n"
+                f"  - Только в df1: {total_df1_only}\n"
+                f"  - Только в df2: {total_df2_only}\n"
+                f"  - Различия в значениях: {total_diff}"
+            )
+
+    def _on_comparison_error(self, error_msg):
+        """Обработка ошибки сравнения"""
+        self.progress_bar.hide()
+        self.btn_compare.setEnabled(True)
+        self.btn_save.setEnabled(False)
+        
+        self.log(f"\nОШИБКА: {error_msg}", is_error=True)
+        QMessageBox.critical(self, "Ошибка сравнения", error_msg)
+    
+    def _display_results(self):
+        """Отображение результатов в таблицах"""
+        self.results_tabs.clear()
+        
+        if self.comparator is None:
+            return
+        
+        # Получаем реальные totals для чанкового режима
+        is_chunked = hasattr(self.comparator, '_total_only1')
+        
+        # В чанковом режиме читаем ПОЛНЫЕ результаты из временных CSV файлов
+        if is_chunked:
+            saved_files = {}
+            if hasattr(self.comparator, 'get_saved_files'):
+                for fpath in self.comparator.get_saved_files():
+                    if os.path.exists(fpath):
+                        fname = os.path.basename(fpath)
+                        saved_files[fname] = fpath
+            
+            df1_only_full = pd.read_csv(saved_files.get('df1_only.csv'), encoding='utf-8-sig') if 'df1_only.csv' in saved_files else pd.DataFrame()
+            df2_only_full = pd.read_csv(saved_files.get('df2_only.csv'), encoding='utf-8-sig') if 'df2_only.csv' in saved_files else pd.DataFrame()
+            diff_full = pd.read_csv(saved_files.get('differences.csv'), encoding='utf-8-sig') if 'differences.csv' in saved_files else None
+        else:
+            df1_only_full = self.comparator.df1_only
+            df2_only_full = self.comparator.df2_only
+            diff_full = self.comparator.df1_df2_value
+        
+        # Получаем реальные totals для названий вкладок
+        total_df1_only = getattr(self.comparator, '_total_only1', len(df1_only_full)) if is_chunked else len(df1_only_full)
+        total_df2_only = getattr(self.comparator, '_total_only2', len(df2_only_full)) if is_chunked else len(df2_only_full)
+        total_diff = getattr(self.comparator, '_total_diff', len(diff_full)) if is_chunked and diff_full is not None else (len(diff_full) if diff_full is not None else 0)
+        
+        # Таблица "Только в df1"
+        if not df1_only_full.empty:
+            tab1 = self._create_table_widget(df1_only_full, show_all=False)
+            tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df1_only else ""
+            self.results_tabs.addTab(tab1, f"{tab_title}Только в df1 ({total_df1_only})")
+        else:
+            tab1 = QWidget()
+            tab1_layout = QVBoxLayout(tab1)
+            tab1_layout.addWidget(QLabel("Нет строк, присутствующих только в df1"))
+            self.results_tabs.addTab(tab1, "Только в df1 (0)")
+        
+        # Таблица "Только в df2"
+        if not df2_only_full.empty:
+            tab2 = self._create_table_widget(df2_only_full, show_all=False)
+            tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df2_only else ""
+            self.results_tabs.addTab(tab2, f"{tab_title}Только в df2 ({total_df2_only})")
+        else:
+            tab2 = QWidget()
+            tab2_layout = QVBoxLayout(tab2)
+            tab2_layout.addWidget(QLabel("Нет строк, присутствующих только в df2"))
+            self.results_tabs.addTab(tab2, "Только в df2 (0)")
+        
+        # Таблица "Различия в значениях"
+        if diff_full is not None and not diff_full.empty:
+            if is_chunked:
+                # В чанковом режиме: все данные, но видно только 3 строки, остальное скроллом
+                tab3 = self._create_table_widget(diff_full, show_all=True, max_visible_rows=3)
+            else:
+                tab3 = self._create_table_widget(diff_full, show_all=False)
+            tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df1_df2_value else ""
+            self.results_tabs.addTab(tab3, f"{tab_title}Различия ({total_diff})")
+        else:
+            tab3 = QWidget()
+            tab3_layout = QVBoxLayout(tab3)
+            tab3_layout.addWidget(QLabel("Нет различий в значениях"))
+            self.results_tabs.addTab(tab3, "Различия (0)")
+        
+        # Если были предупреждения о неуникальных ключах, добавляем вкладку
+        if self.key_uniqueness_warnings:
+            warning_widget = QWidget()
+            warning_layout = QVBoxLayout(warning_widget)
+            
+            # Заголовки в одну строку
+            if len(self.key_uniqueness_warnings) > 1:
+                headers_layout = QHBoxLayout()
+            else:
+                headers_layout = QVBoxLayout()
+            
+            # Создаём горизонтальный layout для таблиц
+            if len(self.key_uniqueness_warnings) > 1:
+                tables_layout = QHBoxLayout()
+            else:
+                tables_layout = QVBoxLayout()
+            
+            for i, (msg, details) in enumerate(self.key_uniqueness_warnings):
+                warning_label = QLabel(f"⚠ {msg}")
+                warning_label.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
+                headers_layout.addWidget(warning_label)
+                
+                # Показываем образцы дубликатов таблицей
+                if i < len(self.key_uniqueness_samples):
+                    sample_table_name, sample_df = self.key_uniqueness_samples[i]
+                    if sample_df is not None and not sample_df.empty:
+                        # Создаём виджет для каждой таблицы
+                        table_widget = QWidget()
+                        table_inner_layout = QVBoxLayout(table_widget)
+                        
+                        sample_table = QTableWidget()
+                        sample_table.setColumnCount(len(sample_df.columns))
+                        sample_table.setHorizontalHeaderLabels(sample_df.columns.tolist())
+                        sample_table.setRowCount(len(sample_df))
+                        
+                        for row_idx, (_, row) in enumerate(sample_df.iterrows()):
+                            for col_idx, col_name in enumerate(sample_df.columns):
+                                value = str(row[col_name]) if pd.notna(row[col_name]) else ""
+                                item = QTableWidgetItem(value)
+                                sample_table.setItem(row_idx, col_idx, item)
+                        
+                        header = sample_table.horizontalHeader()
+                        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+                        header.setStretchLastSection(True)
+                        table_inner_layout.addWidget(sample_table)
+                        
+                        # Кнопка копирования
+                        copy_btn = QPushButton("📋 Копировать в буфер")
+                        copy_btn.clicked.connect(lambda sd=sample_df: self._copy_to_clipboard(sd))
+                        table_inner_layout.addWidget(copy_btn)
+                        
+                        tables_layout.addWidget(table_widget)
+            
+            warning_layout.addLayout(headers_layout)
+            warning_layout.addLayout(tables_layout)
+            
+            self.results_tabs.addTab(warning_widget, f"⚠ Предупреждения ({len(self.key_uniqueness_warnings)})")
+    
+
+    def _create_table_widget(self, df: pd.DataFrame, max_display_rows: int = None, info_text_override: str = None, show_all: bool = False, max_visible_rows: int = None) -> QWidget:
+        """Создание виджета таблицы из DataFrame с подсветкой различий
+        
+        Args:
+            df: DataFrame для отображения
+            max_display_rows: лимит отображения строк (по умолчанию self.max_display_rows)
+            info_text_override: если задан, заменяет автоматический info label
+            show_all: если True — показывать все строки (для чанкового режима)
+            max_visible_rows: если задан, ограничивает видимую высоту таблицы (остальное скроллом)
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # Применяем лимит отображения (in-memory режим)
+        # В chunked-режиме с show_all=True — показываем все строки
+        if max_display_rows is None:
+            max_display_rows = self.max_display_rows
+        
+        if show_all:
+            display_df = df
+            total_rows = len(df)
+        else:
+            total_rows = len(df)
+            display_df = df.head(max_display_rows) if len(df) > max_display_rows else df
+        
+        # Информация о таблице
+        if info_text_override:
+            info_label = QLabel(info_text_override)
+        elif not show_all and total_rows > max_display_rows:
+            info_label = QLabel(
+                f"Показаны первые {len(display_df)} из {total_rows} строк, "
+                f"Столбцов: {len(df.columns)}"
+            )
+        else:
+            info_label = QLabel(f"Строк: {total_rows}, Столбцов: {len(df.columns)}")
+        info_label.setStyleSheet("font-weight: bold; padding: 5px;")
+        layout.addWidget(info_label)
+        
+        # Таблица
+        table = QTableWidget()
+        table.setColumnCount(len(display_df.columns))
+        table.setHorizontalHeaderLabels(display_df.columns.tolist())
+        table.setRowCount(len(display_df))
+        
+        # Ограничиваем размер таблицы
+        if max_visible_rows is not None:
+            # Ограничиваем видимую часть указанным количеством строк
+            table_height = min(max_visible_rows * 30 + 50, 600)
+        else:
+            table_height = min(len(display_df) * 30 + 50, 600)
+        
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table.setMaximumHeight(table_height)
+        table.setMinimumHeight(table_height)
+        table.resize(table.width(), table_height)
+        table.updateGeometry()
+        QApplication.processEvents()
+        
+        # Определяем пары столбцов для сравнения (без суффиксов _df1 и _df2)
+        column_pairs = []
+        base_columns = set()
+        
+        for col in df.columns:
+            if col.endswith("_df1"):
+                base_name = col[:-4]
+                base_columns.add(base_name)
+            elif col.endswith("_df2"):
+                base_name = col[:-4]
+                base_columns.add(base_name)
+        
+        # Создаем словарь соответствия базовых имен столбцам
+        col_mapping = {}
+        for base_name in base_columns:
+            df1_col = f"{base_name}_df1"
+            df2_col = f"{base_name}_df2"
+            if df1_col in df.columns and df2_col in df.columns:
+                col_mapping[base_name] = (df1_col, df2_col)
+        
+        for row_idx, (_, row) in enumerate(display_df.iterrows()):
+            for col_idx, col_name in enumerate(display_df.columns):
+                value = str(row[col_name]) if pd.notna(row[col_name]) else ""
+                item = QTableWidgetItem(value)
+                # Подсветка сравниваемых столбцов
+                if "_df1" in col_name or "_df2" in col_name:
+                    item.setBackground(Qt.yellow)
+                # Проверяем, является ли столбец частью пары для сравнения
+                is_diff_column = False
+                for base_name, (df1_col, df2_col) in col_mapping.items():
+                    if col_name == df1_col or col_name == df2_col:
+                        is_diff_column = True
+                        
+                        # Получаем значения для сравнения
+                        val1 = row[df1_col]
+                        val2 = row[df2_col]
+                        
+                        # Сравниваем значения
+                        if pd.isna(val1) and pd.isna(val2):
+                            are_equal = True
+                        elif pd.isna(val1) or pd.isna(val2):
+                            are_equal = False
+                        elif isinstance(val1, (int, float)) and isinstance(val2, (int, float)):
+                            tolerance = self.current_tolerance
+                            are_equal = abs(float(val1) - float(val2)) <= tolerance
+                        else:
+                            are_equal = str(val1) == str(val2)
+                        
+                        # Если значения не совпадают, выделяем ячейку красным
+                        if not are_equal:
+                            item.setBackground(QColor(255, 200, 200))  # Светло-красный
+                            item.setForeground(QColor(200, 0, 0))  # Красный текст
+                        
+                        break
+                
+                # Если это ключевой столбец, выделяем его светло-желтым
+                if not is_diff_column and col_name in self.current_compare_columns:
+                    if item.background() == QColor(255, 255, 255) or item.background() == Qt.white:
+                        item.setBackground(QColor(255, 255, 200))  # Светло-желтый
+                
+                table.setItem(row_idx, col_idx, item)
+        
+        # Подсветка заголовков столбцов с различиями (опционально, через QHeaderView)
+        # Примечание: QHeaderView.setCellWidget недоступен в Qt5/PySide6,
+        # поэтому подсветка заголовков реализована через stylesheet
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setStretchLastSection(True)
+        
+        # Разрешаем сортировку
+        table.setSortingEnabled(True)
+        
+        layout.addWidget(table)
+        
+        # Кнопка "Копировать в буфер"
+        copy_btn = QPushButton("📋 Копировать в буфер")
+        copy_btn.clicked.connect(lambda: self._copy_to_clipboard(df))
+        layout.addWidget(copy_btn)
+        
+        return widget
+    
+    def _copy_to_clipboard(self, df: pd.DataFrame):
+        """Копирование DataFrame в буфер обмена в формате TSV"""
+        try:
+            clipboard = QApplication.clipboard()
+            tsv_data = df.to_csv(sep='\t', index=False)
+            clipboard.setText(tsv_data)
+            self.log(f"Скопировано {len(df)} строк в буфер обмена")
+        except Exception as e:
+            self.log(f"Ошибка копирования: {e}", is_error=True)
+
+    def _save_results(self):
+        """Сохранение результатов в единый Excel-файл с вкладками"""
+        if self.comparator is None:
+            QMessageBox.warning(self, "Предупреждение", "Нет результатов для сохранения!")
+            return
+        
+        # Используем выбранный каталог
+        output_dir = self.output_dir
+        
+        # Лимит строк на вкладку Excel (openpyxl падает на больших файлах)
+        EXCEL_ROW_LIMIT = 1_000_000
+        
+        try:
+            # Создаем подкаталог с меткой времени
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_dir = output_dir / f"comparison_{timestamp}"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            excel_path = (save_dir / f"report_{timestamp}.xlsx").resolve()
+            csv_path = (save_dir / f"report_{timestamp}.csv").resolve()
+            
+            # Собираем данные для сводки
+            summary_data = {
+                "Параметр": [
+                    "Файл 1 (строк)",
+                    "Файл 2 (строк)",
+                    "Только в df1",
+                    "Только в df2",
+                    "Различия в значениях",
+                    "Время сравнения"
+                ],
+                "Значение": [
+                    str(len(self.df1)) if self.df1 is not None else "N/A",
+                    str(len(self.df2)) if self.df2 is not None else "N/A",
+                    str(len(self.comparator.df1_only)),
+                    str(len(self.comparator.df2_only)),
+                    str(len(self.comparator.df1_df2_value)) if self.comparator.df1_df2_value is not None else "0",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ]
+            }
+            
+            # Определяем, что сохранять (Excel или CSV)
+            df1_only = self.comparator.df1_only
+            df2_only = self.comparator.df2_only
+            df1_df2_value = self.comparator.df1_df2_value
+            
+            # Для чанкового режима получаем реальные total из comparator
+            # (в df1_only/df2_only/diff лежит только усечённый preview)
+            is_chunked = hasattr(self.comparator, '_total_only1')
+            total_df1_only = getattr(self.comparator, '_total_only1', len(df1_only)) if is_chunked else len(df1_only)
+            total_df2_only = getattr(self.comparator, '_total_only2', len(df2_only)) if is_chunked else len(df2_only)
+            total_diff = getattr(self.comparator, '_total_diff', len(df1_df2_value)) if is_chunked and df1_df2_value is not None else (len(df1_df2_value) if df1_df2_value is not None else 0)
+            
+            # Если любой набор превышает лимит — пишем в CSV
+            use_excel = (
+                (df1_only.empty or len(df1_only) <= EXCEL_ROW_LIMIT) and
+                (df2_only.empty or len(df2_only) <= EXCEL_ROW_LIMIT) and
+                (df1_df2_value is None or df1_df2_value.empty or len(df1_df2_value) <= EXCEL_ROW_LIMIT)
+            )
+            
+            sheet_num = 1
+            
+            if use_excel:
+                # Excel — для небольших наборов данных
+                with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                    if not df1_only.empty:
+                        df1_only.to_excel(writer, sheet_name=f"Только в df1 ({total_df1_only})", index=False)
+                        sheet_num += 1
+                    
+                    if not df2_only.empty:
+                        df2_only.to_excel(writer, sheet_name=f"Только в df2 ({total_df2_only})", index=False)
+                        sheet_num += 1
+                    
+                    if df1_df2_value is not None and not df1_df2_value.empty:
+                        df1_df2_value.to_excel(writer, sheet_name=f"Различия ({total_diff})", index=False)
+                        sheet_num += 1
+                    
+                    pd.DataFrame(summary_data).to_excel(writer, sheet_name="Сводка", index=False)
+                
+                saved_path = excel_path
+                saved_format = "Excel"
+            else:
+                # CSV — для больших наборов данных
+                if not df1_only.empty:
+                    df1_only.to_csv(save_dir / "df1_only.csv", index=False, encoding='utf-8-sig')
+                    sheet_num += 1
+                
+                if not df2_only.empty:
+                    df2_only.to_csv(save_dir / "df2_only.csv", index=False, encoding='utf-8-sig')
+                    sheet_num += 1
+                
+                if df1_df2_value is not None and not df1_df2_value.empty:
+                    df1_df2_value.to_csv(save_dir / "df1_df2_value.csv", index=False, encoding='utf-8-sig')
+                    sheet_num += 1
+                
+                # Сводка в CSV
+                pd.DataFrame(summary_data).to_csv(save_dir / "summary.csv", index=False, encoding='utf-8-sig')
+                
+                saved_path = save_dir
+                saved_format = "CSV"
+            
+            self.log(f"Сохранено: {saved_path} ({saved_format})")
+
+            # Для чанкового режима копируем ПОЛНЫЕ результаты из временного
+            # каталога (в comparator.df1_only/df2_only/diff лежит только
+            # усечённый max_display_rows preview).
+            if hasattr(self.comparator, 'get_saved_files'):
+                import shutil
+                copied = []
+                for src in self.comparator.get_saved_files():
+                    if os.path.exists(src):
+                        dst = save_dir / os.path.basename(src)
+                        shutil.copy2(src, dst)
+                        copied.append(str(dst))
+                if copied:
+                    self.log(f"Скопированы полные результаты ({len(copied)} файлов):")
+                    for c in copied:
+                        self.log(f"  {c}")
+            
+            # Сохраняем информацию о предупреждениях, если они были
+            if self.key_uniqueness_warnings:
+                warnings_path = save_dir / "key_uniqueness_warnings.txt"
+                with open(warnings_path, 'w', encoding='utf-8') as f:
+                    for msg, details in self.key_uniqueness_warnings:
+                        f.write(f"{msg}\n")
+                        f.write("=" * 80 + "\n")
+                        f.write(f"{details}\n")
+                        f.write("\n" + "=" * 80 + "\n\n")
+                self.log(f"Сохранено: {warnings_path}")
+            
+            # Формируем сообщение
+            if use_excel:
+                msg = f"Результаты сохранены в:\n{saved_path}\n\nФайл содержит {sheet_num} вкладок."
+            else:
+                msg = f"Результаты сохранены в:\n{saved_path}\n\nФормат: CSV\nФайлов: {sheet_num}"
+            
+            reply = QMessageBox.information(
+                self, "Сохранение",
+                msg + "\n\nОткрыть папку?",
+                QMessageBox.No | QMessageBox.Open
+            )
+            
+            if reply == QMessageBox.Open:
+                from PySide6.QtCore import QUrl
+                from PySide6.QtGui import QDesktopServices
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(save_dir)))
+            
+            # Очищаем временные файлы после успешного сохранения
+            if self.comparator is not None and hasattr(self.comparator, 'cleanup'):
+                try:
+                    self.comparator.cleanup()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка сохранения", str(e))
+            self.log(f"Ошибка сохранения: {e}", is_error=True)
+    
+
+    def _clear_all(self):
+        """Полная очистка"""
+        self.comparator = None
+        self.df1 = None
+        self.df2 = None
+        self.key_uniqueness_warnings = []
+        self.key_uniqueness_samples = []
+        self.results_tabs.clear()
+        self.log_panel.clear()
+        self.file1_path.clear()
+        self.file2_path.clear()
+        self.btn_save.setEnabled(False)
+        self.btn_compare.setEnabled(False)
+        self.log("Все данные очищены")
+
+    def _update_button_states(self):
+        """Обновление состояния кнопок и цветовой индикации"""
+        path1 = self.file1_path.text().strip()
+        path2 = self.file2_path.text().strip()
+        has_files = bool(path1) and bool(path2) and os.path.exists(path1) and os.path.exists(path2)
+        self.btn_compare.setEnabled(has_files)
+        
+        # Цветовая индикация полей файлов
+        self._update_file_field_color(self.file1_path, "Файл 1")
+        self._update_file_field_color(self.file2_path, "Файл 2")
+    
+    def _update_file_field_color(self, field: QLineEdit, field_name: str):
+        """Обновление цвета рамки поля в зависимости от статуса"""
+        text = field.text().strip()
+        if not text:
+            field.setStyleSheet("border: 1px solid #ccc;")
+        elif os.path.exists(text):
+            field.setStyleSheet("border: 2px solid #4CAF50; background-color: #E8F5E9;")
+        else:
+            field.setStyleSheet("border: 2px solid #F44336; background-color: #FFEBEE;")
+    
+    def _load_last_session(self):
+        """Загрузка последней сессии из файла"""
+        try:
+            session_file = Path.home() / ".compare_csv_session.json"
+            if session_file.exists():
+                with open(session_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                file1 = data.get('file1', '')
+                file2 = data.get('file2', '')
+                schema = data.get('schema', '')
+                separator = data.get('separator', ',')
+                sep_auto = data.get('sep_auto', False)
+                chunked = data.get('chunked', False)
+                chunksize = data.get('chunksize', 50000)
+                agg = data.get('agg', False)
+                agg_func = data.get('agg_func', 'sum')
+                tolerance = data.get('tolerance', 0)
+                
+                if file1 and os.path.exists(file1):
+                    self.file1_path.setText(file1)
+                if file2 and os.path.exists(file2):
+                    self.file2_path.setText(file2)
+                if schema:
+                    self.schema_combo.blockSignals(True)
+                    self.schema_combo.setCurrentText(schema)
+                    self.schema_combo.blockSignals(False)
+                    # Применяем восстановленную схему
+                    self.apply_schema_template(schema)
+                
+                # Восстанавливаем разделитель
+                if separator in [',', ';', '\t', '|']:
+                    self.sep_combo.setCurrentText(separator)
+                
+                # Восстанавливаем автоопределение разделителя
+                self.sep_auto_checkbox.setChecked(sep_auto)
+                
+                # Восстанавливаем чанковый режим
+                self.chunked_checkbox.setChecked(chunked)
+                self.chunksize_spin.setValue(chunksize)
+                
+                # Восстанавливаем агрегацию
+                self.agg_checkbox.setChecked(agg)
+                if agg_func in ["sum", "mean", "min", "max"]:
+                    self.agg_func_combo.setCurrentText(agg_func)
+                
+                # Восстанавливаем точность
+                self.tolerance_spin.setValue(int(tolerance))
+                
+                self.log("Сессия восстановлена из предыдущего запуска")
+        except Exception as e:
+            self.log(f"Не удалось загрузить сессию: {e}")
+    
+    def _save_last_session(self):
+        """Сохранение текущей сессии в файл"""
+        try:
+            session_file = Path.home() / ".compare_csv_session.json"
+            data = {
+                'file1': self.file1_path.text(),
+                'file2': self.file2_path.text(),
+                'schema': self.schema_combo.currentText(),
+                'separator': self.sep_combo.currentText(),
+                'sep_auto': self.sep_auto_checkbox.isChecked(),
+                'chunked': self.chunked_checkbox.isChecked(),
+                'chunksize': self.chunksize_spin.value(),
+                'agg': self.agg_checkbox.isChecked(),
+                'agg_func': self.agg_func_combo.currentText(),
+                'tolerance': self.tolerance_spin.value()
+            }
+            with open(session_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"Не удалось сохранить сессию: {e}")
+    
+    def closeEvent(self, event):
+        """Обработка закрытия окна"""
+        # Сохраняем сессию
+        self._save_last_session()
+        
+        # Останавливаем worker если он работает
+        if hasattr(self, 'worker') and self.worker is not None:
+            if self.worker.isRunning():
+                self.worker.terminate()
+                self.worker.wait()
+
+
+        # Удаляем временные файлы компаратора
+        if self.comparator is not None and hasattr(self.comparator, 'cleanup'):
+            try:
+                self.comparator.cleanup()
+            except Exception:
+                pass                
+        
+        event.accept()
+
+    def log(self, message: str, is_error: bool = False):
+        """Добавление сообщения в лог"""
+        cursor = self.log_panel.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        
+        if is_error:
+            self.log_panel.setTextColor(Qt.red)
+        else:
+            self.log_panel.setTextColor(Qt.black)
+        
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        cursor.insertText(f"[{timestamp}] {message}\n")
+        cursor.movePosition(QTextCursor.End)
+        self.log_panel.setTextCursor(cursor)
+        self.log_panel.ensureCursorVisible()
+
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+
+===== FILE: ./read_csv_with_schema.py =====
+import pandas as pd
+from typing import Dict, Optional
+
+
+def read_csv_with_schema_v1(
+    file_path: str,
+    type_mapping: Optional[Dict[str, str]] = None,
+    default_type: str = "string",
+    **kwargs
+) -> pd.DataFrame:
+    """
+    Считывает CSV файл с указанной схемой типов данных.
+    
+    Использует pandas nullable-типы для NaN-устойчивости:
+    - 'int' → 'Int64' (позволяет NaN)
+    - 'bool' → 'boolean' (позволяет NaN)
+    - 'float' → 'float64' (NaN уже поддерживается)
+    - 'string' → 'string' (по умолчанию)
+    
+    Args:
+        file_path: Путь к CSV файлу
+        type_mapping: Словарь с маппингом названий столбцов на типы данных.
+                      Пример: {"Столбец3": "float", "Столбец9": "int"}
+        default_type: Тип данных по умолчанию для столбцов, не указанных в type_mapping
+                      По умолчанию "string"
+        **kwargs: Дополнительные параметры для pd.read_csv()
+    
+    Returns:
+        pd.DataFrame: Датафрейм с правильно типизированными столбцами
+    
+    Raises:
+        FileNotFoundError: Если файл не найден
+        ValueError: Если тип данных неподдерживаемый
+        pd.errors.ParserError: Если файл некорректный CSV
+    
+    Example:
+        >>> type_mapping = {"Столбец3": "float", "Столбец9": "int"}
+        >>> df = read_csv_with_schema("data.csv", type_mapping)
+    """
+    
+    if type_mapping is None:
+        type_mapping = {}
+    
+    # Маппинг логических типов на pandas nullable-типы
+    # Int64 (заглавная I) и boolean — поддерживают NaN
+    NAIVE_TYPE_MAP = {
+        'int': 'Int64',
+        'float': 'float64',
+        'bool': 'boolean',
+        'string': 'string',
+    }
+    
+    def resolve_dtype(col_type: str) -> str:
+        """Преобразует логический тип в безопасный pandas dtype."""
+        resolved = NAIVE_TYPE_MAP.get(col_type)
+        if resolved is None:
+            raise ValueError(
+                f"Неподдерживаемый тип '{col_type}'. "
+                f"Поддерживаемые: {', '.join(NAIVE_TYPE_MAP.keys())}"
+            )
+        return resolved
+    
+    try:
+        # Считываем заголовки — sep/encoding должны совпадать с финальным чтением
+        header_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k in ('sep', 'delimiter', 'encoding', 'sep_whitespace', 'quotechar')
+        }
+        df_temp = pd.read_csv(file_path, nrows=0, **header_kwargs)        
+        columns = df_temp.columns.tolist()
+        
+        # Создаём словарь dtype с nullable-типами
+        dtype_dict = {}
+        for column in columns:
+            raw_type = type_mapping.get(column, default_type)
+            dtype_dict[column] = resolve_dtype(raw_type)
+        
+        # Читаем файл с указанной типизацией
+        df = pd.read_csv(file_path, dtype=dtype_dict, **kwargs)
+        
+        return df
+    
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Файл не найден: {file_path}")
+    except pd.errors.ParserError as e:
+        raise pd.errors.ParserError(f"Ошибка при чтении CSV файла: {e}")
+    except Exception as e:
+        raise Exception(f"Ошибка при обработке файла: {e}")
+
+===== FILE: ./schemas.json =====
+{
+  "schemas": {
+    "Стандартная (12 полей)": {
+      "schema": {
+        "Код ЦФО": "string",
+        "Источник аллокации": "string",
+        "Сегмент для отчета": "string",
+        "Квартал": "string",
+        "План/Прогноз": "string",
+        "Группировка для анализа": "string",
+        "ДЗО": "string",
+        "БЕ": "string",
+        "Пользовательская": "string",
+        "Predict/SAP": "string",
+        "Версия": "string",
+        "Значение": "float"
+      },
+      "key_columns": [
+        "Код ЦФО",
+        "Источник аллокации",
+        "Сегмент для отчета",
+        "Квартал",
+        "План/Прогноз",
+        "Группировка для анализа",
+        "ДЗО",
+        "БЕ",
+        "Пользовательская",
+        "Predict/SAP",
+        "Версия"
+      ],
+      "tolerance": 0.0
+    },
+    "DZO Revenue Forecast 9+3": {
+      "schema": {
+        "Код ДЗО Forecast": "string",
+        "Код ЦФО": "string",
+        "Статья Hyperion Forecast": "string",
+        "Сегмент для отчета": "string",
+        "Источник аллокации": "string",
+        "Q3": "string",
+        "Q4": "float",
+        "Jul": "float",
+        "Aug": "float",
+        "Sep": "float",
+        "Oct": "float",
+        "Nov": "float",
+        "Dec": "float"
+      },
+      "key_columns": [
+        "Код ДЗО Forecast",
+        "Код ЦФО",
+        "Статья Hyperion Forecast",
+        "Сегмент для отчета",
+        "Источник аллокации"
+      ],
+      "tolerance": 0.001
+    },
+    "DZO Percent": {
+      "schema": {
+        "Код ДЗО Forecast": "string",
+        "Сегмент для отчета": "string",
+        "%": "float"
+      },
+      "key_columns": [
+        "Код ДЗО Forecast",
+        "Сегмент для отчета"
+      ],
+      "tolerance": 1e-06
+    },
+    "DZO Revenue": {
+      "schema": {
+        "Код ДЗО Forecast": "string",
+        "Код ЦФО": "string",
+        "Статья Hyperion Forecast": "string",
+        "Сегмент для отчета": "string",
+        "Значение": "float"
+      },
+      "key_columns": [
+        "Код ДЗО Forecast",
+        "Код ЦФО",
+        "Статья Hyperion Forecast",
+        "Сегмент для отчета",
+        "Значение"
+      ],
+      "tolerance": 0.0001
+    },
+    "Test": {
+      "schema": {
+        "Сегмент для отчета": "string",
+        "Квартал": "string",
+        "Значение": "float"
+      },
+      "key_columns": [
+        "Сегмент для отчета",
+        "Квартал"
+      ],
+      "tolerance": 1e-06
+    },
+    "Расчет численности по сценариям": {
+      "schema": {
+        "Ур.0": "string",
+        "Ур.1": "string",
+        "Ур.2": "string",
+        "Ур.3": "string",
+        "Ур.4": "string",
+        "Ур.5": "string",
+        "Ур.6": "string",
+        "Группа": "string",
+        "Подгруппа": "string",
+        "Вес подгруппы": "float",
+        "Признак. Нормирование в ДМЧ": "string",
+        "Код функции": "string",
+        "Код Hyperion": "string",
+        "Имя Hyperion": "string",
+        "№ драйвера": "string",
+        "Название драйвера": "string",
+        "Текущая численность. экв. ШЕ": "float",
+        "Значение драйвера": "float",
+        "Сценарий драйвера": "float",
+        "Удельный показатель": "float",
+        "Сценарий УП": "float",
+        "Численность по УП. ШЕ": "float",
+        "ИПК": "string",
+        "Скорр. УП": "float",
+        "Базовый норматив": "float",
+        "Сценарий БН": "string",
+        "Уравнивать лучших до норматива?": "string",
+        "Индивидуальный норматив": "float",
+        "Целевая численность. ШЕ": "float",
+        "Разница численности (целевая численность - текущая численность)": "float"
+      },
+      "key_columns": [
+        "Ур.0",
+        "Ур.1",
+        "Ур.2",
+        "Ур.3",
+        "Ур.4",
+        "Ур.5",
+        "Ур.6"
+      ],
+      "tolerance": 0.0
+    },
+    "корректировки": {
+      "schema": {
+        "Код ЦФО": "string",
+        "Статья Hyperion Forecast": "string",
+        "Сегмент для отчета": "string",
+        "Период": "string",
+        "Принадлежность": "string",
+        "Версия": "string",
+        "Код типа": "float",
+        "Сумма к изъятию (SA)": "float",
+        "Сумма к изъятию (ВГО)": "float",
+        "Сумма (SA)": "float",
+        "Сумма (ВГО)": "float"
+      },
+      "key_columns": [
+        "Код типа",
+        "Код ЦФО",
+        "Статья Hyperion Forecast",
+        "Сегмент для отчета",
+        "Версия",
+        "Период",
+        "Принадлежность"
+      ],
+      "tolerance": 0.0001
+    },
+    "аналитика_прогноза": {
+      "schema": {
+        "Код ЦФО": "string",
+        "Источник аллокации": "string",
+        "Сегмент для отчета": "string",
+        "Квартал": "string",
+        "План/Прогноз": "string",
+        "Группировка для анализа": "string",
+        "ДЗО": "string",
+        "БЕ": "string",
+        "Пользовательская": "string",
+        "Predict/SAP": "string",
+        "Версия": "string",
+        "Значение": "float"
+      },
+      "key_columns": [
+        "Код ЦФО",
+        "Источник аллокации",
+        "Сегмент для отчета",
+        "Квартал",
+        "План/Прогноз",
+        "Группировка для анализа",
+        "ДЗО",
+        "БЕ",
+        "Пользовательская",
+        "Predict/SAP",
+        "Версия"
+      ],
+      "tolerance": 1e-06
+    },
+    "Коды нумерации": {
+      "schema": {
+        "АВС/ DEF": "int",
+        "От": "int",
+        "До": "int",
+        "Емкость": "int",
+        "Оператор": "string",
+        "Регион": "string"
+      },
+      "key_columns": [
+        "АВС/ DEF",
+        "От",
+        "До"
+      ],
+      "tolerance": 0.0
+    },
+    "123": {
+      "schema": {
+        "Код ДЗО Forecast": "string",
+        "Код ЦФО": "string",
+        "Статья Hyperion Forecast": "string",
+        "Сегмент для отчета": "string",
+        "Источник аллокации": "string",
+        "Q3": "string",
+        "Q4": "float",
+        "Jul": "float",
+        "Aug": "float",
+        "Sep": "float",
+        "Oct": "float",
+        "Nov": "float",
+        "Dec": "float"
+      },
+      "key_columns": [
+        "Код ДЗО Forecast",
+        "Код ЦФО",
+        "Статья Hyperion Forecast",
+        "Сегмент для отчета"
+      ],
+      "tolerance": 0.001
+    },
+    "456": {
+      "schema": {
+        "АВС/ DEF": "int",
+        "От": "int",
+        "До": "int",
+        "Емкость": "int",
+        "Оператор": "string",
+        "Регион": "string"
+      },
+      "key_columns": [
+        "АВС/ DEF",
+        "От",
+        "До"
+      ],
+      "tolerance": 1e-06
+    }
+  }
+}
+
+===== FILE: ./utils.py =====
+"""
+Общие утилиты для compare_csv_sql.
+Вынесены из main.py, chunked_comparator.py и data_frame_comparator.py
+для устранения дублирования кода.
+"""
+
+from typing import Dict, List, Optional, Tuple
+
+
+def sort_columns_with_suffixes(df, key_columns: List[str], schema: Dict[str, str] = None):
+    """
+    Сортирует столбцы DataFrame: ключевые первыми, остальные попарно (_df1, _df2).
+    
+    Порядок non-key столбцов определяется схемой (schema), если она передана.
+    Иначе используется порядок из DataFrame.
+    
+    Args:
+        df: DataFrame для сортировки
+        key_columns: Список ключевых столбцов
+        schema: Словарь схемы {column_name: column_type} (опционально)
+    
+    Returns:
+        DataFrame с отсортированными столбцами
+    """
+    key_cols = [col for col in key_columns if col in df.columns]
+    other_cols = [col for col in df.columns if col not in key_cols]
+    
+    # Определяем порядок non-key столбцов
+    if schema:
+        # # Порядок из схемы (сохраняет пользовательский порядок)
+        # schema_cols = [col for col in schema.keys() if col not in key_cols]
+        # # Сохраняем только те, что есть в other_cols (на случай расхождений)
+        # schema_order = [col for col in schema_cols if col in other_cols]
+        # # Добавляем остальные, которых нет в схеме (на всякий случай)
+        # remaining = [col for col in other_cols if col not in schema_order]
+        # ordered_bases = schema_order + remaining
+    # Идём по схеме и для каждого базового имени берём существующие суффиксы
+        ordered_bases = []
+        for base in schema.keys():
+            if base in key_cols:
+                continue
+            for suffixed in (f"{base}_df1", f"{base}_df2", base):
+                if suffixed in other_cols:
+                    ordered_bases.append(suffixed)
+        # добавляем всё, что не покрыто схемой
+        for col in other_cols:
+            if col not in ordered_bases:
+                ordered_bases.append(col)        
+    else:
+        # Fallback: порядок из DataFrame
+        ordered_bases = other_cols
+    
+    # Группируем base_name -> (_df1, _df2)
+    base_to_suffixes = {}
+    for col in ordered_bases:
+        if col.endswith("_df1"):
+            base = col[:-4]
+            base_to_suffixes.setdefault(base, []).append("_df1")
+        elif col.endswith("_df2"):
+            base = col[:-4]
+            base_to_suffixes.setdefault(base, []).append("_df2")
+        else:
+            # Столбец без суффикса — добавляем как есть
+            base_to_suffixes.setdefault(col, []).append(None)
+    
+    # Собираем итоговый список столбцов
+    sorted_other_cols = []
+    for base in base_to_suffixes:
+        suffixes = base_to_suffixes[base]
+        if None in suffixes:
+            # Столбец без суффикса
+            sorted_other_cols.append(base)
+        else:
+            # Парные столбцы _df1, _df2
+            if "_df1" in suffixes:
+                sorted_other_cols.append(f"{base}_df1")
+            if "_df2" in suffixes:
+                sorted_other_cols.append(f"{base}_df2")
+    
+    return df[key_cols + sorted_other_cols]
+
+
+def parse_schema_text(text: str) -> Dict[str, str]:
+    """
+    Парсит текстовое представление схемы в словарь {column: type}.
+    
+    Формат: каждая строка - "имя_столбца:тип"
+    Поддерживаемые типы: string, float, int, bool
+    Строки, начинающиеся с '#', игнорируются.
+    
+    Args:
+        text: Текстовое представление схемы
+    
+    Returns:
+        Словарь {column_name: column_type}
+    
+    Raises:
+        ValueError: Если строка имеет неверный формат или неподдерживаемый тип
+    """
+    schema = {}
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        
+        parts = line.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"Неверный формат строки: {line}")
+        
+        col_name = parts[0].strip()
+        col_type = parts[1].strip().lower()
+        
+        if col_type not in ["string", "float", "int", "bool"]:
+            raise ValueError(f"Неподдерживаемый тип '{col_type}'")
+        
+        schema[col_name] = col_type
+    
+    return schema
+
+
+def parse_key_columns(text: str) -> List[str]:
+    """
+    Парсит текст ключевых столбцов (через запятую) в список.
+    
+    Args:
+        text: Текст "col1, col2, col3"
+    
+    Returns:
+        Список ["col1", "col2", "col3"]
+    """
+    if not text or not text.strip():
+        return []
+    return [col.strip() for col in text.split(",")]
+
+
+def auto_detect_separator(file_path: str, encoding: str = 'utf-8') -> str:
+    """
+    Автоопределение разделителя CSV файла по частоте встречаемости.
+    
+    Анализирует первые 8192 байта файла, считает количество
+    запятых, точек с запятой, табуляций и вертикальных табов.
+    Возвращает разделитель с максимальной частотой, если он
+    встречается >= 3 раз. Иначе — ',' (по умолчанию).
+    
+    Args:
+        file_path: Путь к CSV файлу
+        encoding: Кодировка файла (по умолчанию utf-8)
+    
+    Returns:
+        Обнаруженный разделитель (',', ';', '\\t', '|') или ','
+    """
+    try:
+        with open(file_path, 'r', encoding=encoding) as f:
+            sample = f.read(8192)
+        candidates = {
+            ',': sample.count(','),
+            ';': sample.count(';'),
+            '\t': sample.count('\t'),
+            '|': sample.count('|')
+        }
+        best_sep = max(candidates, key=candidates.get)
+        if candidates[best_sep] >= 3:
+            return best_sep
+    except Exception:
+        pass
+    return ','
+
+
+def classify_columns_by_schema(
+    non_key_cols: List[str],
+    schema: Dict[str, str],
+    agg_func: str = 'sum'
+) -> Tuple[List[str], List[str]]:
+    """
+    Разделяет столбцы на числовые и строковые на основе схемы.
+    
+    Использует схему (schema), а не инференцию из данных — детерминировано
+    и одинаково для обоих режимов (InMemory и Chunked).
+    
+    Для agg_func='first' все столбцы идут в non_numeric (не нужна
+    числовая агрегация, 'first' вернёт оригинальное значение).
+    
+    Args:
+        non_key_cols: Список неключевых столбцов
+        schema: Словарь схемы {column_name: column_type}
+        agg_func: Функция агрегации ('sum', 'mean', 'min', 'max', 'first')
+    
+    Returns:
+        (numeric_cols, non_numeric_cols) — два списка столбцов
+    """
+    numeric_cols = []
+    non_numeric_cols = []
+    
+    for col in non_key_cols:
+        if agg_func == 'first':
+            non_numeric_cols.append(col)
+            continue
+        
+        col_type = schema.get(col)
+        if col_type in ('float', 'int'):
+            numeric_cols.append(col)
+        else:
+            non_numeric_cols.append(col)
+    
+    return numeric_cols, non_numeric_cols
+
+

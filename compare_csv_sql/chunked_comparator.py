@@ -280,6 +280,11 @@ class ChunkedComparator:
         for table in ['df1', 'df2']:
             cursor = self.conn.cursor()
             
+            # Получаем общее количество строк для логирования
+            cursor.execute(f'SELECT COUNT(*) FROM {table}')
+            total_rows = cursor.fetchone()[0]
+            self._log(f"  Проверка уникальности в {table}: {total_rows} строк")
+            
             # Группируем по key_json — тому же полю, что используется в compare()
             query = f'''
                 SELECT key_json, COUNT(*) as cnt
@@ -300,7 +305,7 @@ class ChunkedComparator:
             
             if dup_keys_count == 0:
                 results[table] = {'unique': True, 'dup_keys': 0, 'dup_rows': 0}
-                self._log(f"  ✓ {table}: ключи уникальны")
+                self._log(f"  ✓ {table}: все {total_rows} ключей уникальны")
             else:
                 # Подсчитываем общее количество строк с дубликатами
                 count_query = f'''
@@ -315,7 +320,7 @@ class ChunkedComparator:
                 dup_rows_count = cursor.fetchone()[0]
                 
                 results[table] = {'unique': False, 'dup_keys': dup_keys_count, 'dup_rows': dup_rows_count}
-                self._log_error(f"  ⚠️ {table}: обнаружено {dup_keys_count} неуникальных ключей ({dup_rows_count} строк)")
+                self._log_error(f"  ⚠️ {table}: {dup_keys_count} неуникальных ключей ({dup_rows_count} строк из {total_rows})")
                 
                 # Получаем примеры дублирующихся строк (до 20)
                 sample_query = f'''
@@ -701,52 +706,141 @@ class ChunkedComparator:
             FROM df1 a JOIN df2 b ON a.key_hash = b.key_hash
             WHERE a.row_json != b.row_json
         '''
-        self._save_full_result_to_csv(query_diff, ['key_json', 'row1', 'row2'], 'differences.csv')
-        self._expand_csv_columns('differences.csv', mode='diff')
         
+        # Получаем все различия из SQL (по строковому сравнению)
         cursor = self.conn.cursor()
-        cursor.execute(query_diff.replace('SELECT a.key_json, a.row_json AS row1, b.row_json AS row2', 'SELECT COUNT(*)'))
-        total_diff = cursor.fetchone()[0]
+        cursor.execute(query_diff)
+        diff_rows = cursor.fetchall()
+        total_diff = len(diff_rows)
         
-        diff_raw = self._get_display_df(query_diff, ['key_json', 'row1', 'row2'], self.max_display_rows)
-        if not diff_raw.empty:
-            row1_split = diff_raw['row1'].str.split(SEP, expand=True)
-            row2_split = diff_raw['row2'].str.split(SEP, expand=True)
-
+        # Применяем tolerance-фильтр к ПОЛНЫМ данным, а не только к отображаемым
+        if diff_rows:
+            # Парсим все различия
+            all_row1 = [r[1] for r in diff_rows]
+            all_row2 = [r[2] for r in diff_rows]
+            
+            diff_df = pd.DataFrame({'row1': all_row1, 'row2': all_row2})
+            
+            row1_split = diff_df['row1'].str.split(SEP, n=-1, expand=True)
+            row2_split = diff_df['row2'].str.split(SEP, n=-1, expand=True)
+            
             # Дополняем недостающие колонки
-            if row1_split.shape[1] != len(all_cols):
-                for i in range(len(all_cols) - row1_split.shape[1]):
-                    row1_split[i + row1_split.shape[1]] = ''
-            if row2_split.shape[1] != len(all_cols):
-                for i in range(len(all_cols) - row2_split.shape[1]):
-                    row2_split[i + row2_split.shape[1]] = ''
+            if row1_split.shape[1] < len(all_cols):
+                for i in range(row1_split.shape[1], len(all_cols)):
+                    row1_split[i] = ''
+            if row2_split.shape[1] < len(all_cols):
+                for i in range(row2_split.shape[1], len(all_cols)):
+                    row2_split[i] = ''
             row1_split = row1_split.iloc[:, :len(all_cols)]
             row2_split = row2_split.iloc[:, :len(all_cols)]
             row1_split.columns = all_cols
             row2_split.columns = all_cols
-
+            
             # Фильтр по tolerance: строка остаётся в отчёте,
             # если ХОТЯ БЫ ОДИН неключевой столбец вне допуска.
-            # Ранее использовался AND — ошибочно оставляло только строки,
-            # где ВСЕ столбцы различались одновременно.
             mask = pd.Series(False, index=row1_split.index)
             for col in non_key_cols:
                 if self.schema.get(col) == 'float':
                     n1 = pd.to_numeric(row1_split[col], errors='coerce')
                     n2 = pd.to_numeric(row2_split[col], errors='coerce')
-                    # Различие вне допуска ИЛИ ровно один NaN
                     col_diff = ((n1 - n2).abs() > self.tolerance) | (n1.isna() ^ n2.isna())
                     mask |= col_diff
                 elif self.schema.get(col) == 'string':
-                    mask |= (row1_split[col] != row2_split[col])            
-
-            row1_split = row1_split[mask]
-            row2_split = row2_split[mask]
-
+                    mask |= (row1_split[col] != row2_split[col])
+            
+            # Фильтруем ПОЛНЫЕ данные по tolerance
+            row1_split_filtered = row1_split[mask]
+            row2_split_filtered = row2_split[mask]
+            
+            # Обновляем total_diff с учётом tolerance
+            total_diff = len(row1_split_filtered)
+            
+            # Сохраняем ФИЛЬТРОВАННЫЕ данные в CSV
+            if not row1_split_filtered.empty:
+                result_data = {}
+                for col in self.key_columns:
+                    # Получаем key_json для отфильтрованных строк
+                    filtered_indices = row1_split_filtered.index.tolist()
+                    result_data[col] = [diff_rows[i][0].split(SEP)[k] 
+                                       for i in filtered_indices 
+                                       for k, _ in enumerate(self.key_columns)]
+                
+                # Перестраиваем key_columns правильно
+                filtered_keys = [diff_rows[i][0] for i in row1_split_filtered.index.tolist()]
+                key_split_filtered = pd.DataFrame({'key_json': filtered_keys})
+                key_split = key_split_filtered['key_json'].str.split(SEP, n=-1, expand=True)
+                key_split.columns = self.key_columns
+                
+                result_data = {}
+                for col in self.key_columns:
+                    result_data[col] = key_split[col].values
+                for col in non_key_cols:
+                    result_data[f"{col}_df1"] = row1_split_filtered[col].values
+                    result_data[f"{col}_df2"] = row2_split_filtered[col].values
+                
+                diff_filtered = pd.DataFrame(result_data)
+                
+                # Сохраняем отфильтрованные данные
+                filepath = os.path.join(self._temp_dir, 'differences.csv') if self._temp_dir else None
+                if filepath is None:
+                    self._temp_dir = tempfile.mkdtemp(prefix="comp_results_")
+                    filepath = os.path.join(self._temp_dir, 'differences.csv')
+                diff_filtered.to_csv(filepath, index=False, encoding='utf-8-sig')
+                self._saved_files.append(filepath)
+                
+                # Применяем _expand_csv_columns
+                # Раскрываем столбцы (они уже раскрыты, просто обновляем файл)
+                df_csv = pd.read_csv(filepath, encoding='utf-8-sig')
+                # Столбцы уже в правильном формате (key + col_df1/col_df2)
+            else:
+                # Нет различий после фильтрации
+                filepath = os.path.join(self._temp_dir, 'differences.csv') if self._temp_dir else None
+                if filepath is None:
+                    self._temp_dir = tempfile.mkdtemp(prefix="comp_results_")
+                    filepath = os.path.join(self._temp_dir, 'differences.csv')
+                cols = self.key_columns + [f"{col}_df1" for col in non_key_cols] + \
+                       [f"{col}_df2" for col in non_key_cols]
+                pd.DataFrame(columns=cols).to_csv(filepath, index=False, encoding='utf-8-sig')
+                self._saved_files.append(filepath)
+        else:
+            total_diff = 0
+            filepath = os.path.join(self._temp_dir, 'differences.csv') if self._temp_dir else None
+            if filepath is None:
+                self._temp_dir = tempfile.mkdtemp(prefix="comp_results_")
+                filepath = os.path.join(self._temp_dir, 'differences.csv')
+            cols = self.key_columns + [f"{col}_df1" for col in non_key_cols] + \
+                   [f"{col}_df2" for col in non_key_cols]
+            pd.DataFrame(columns=cols).to_csv(filepath, index=False, encoding='utf-8-sig')
+            self._saved_files.append(filepath)
+        
+        self._total_diff = total_diff
+        
+        # Получаем отображаемые данные (лимитируем для UI)
+        diff_full_path = os.path.join(self._temp_dir, 'differences.csv')
+        if os.path.exists(diff_full_path):
+            diff_full = pd.read_csv(diff_full_path, encoding='utf-8-sig')
+            if len(diff_full) > self.max_display_rows:
+                diff_raw = diff_full.head(self.max_display_rows)
+                self._truncated_df1_df2_value = True
+            else:
+                diff_raw = diff_full
+        else:
+            diff_raw = pd.DataFrame()
+        
+        if not diff_raw.empty:
+            row1_split = diff_raw[[c for c in diff_raw.columns if c.endswith("_df1")]].copy()
+            row2_split = diff_raw[[c for c in diff_raw.columns if c.endswith("_df2")]].copy()
+            
+            # Восстанавливаем имена столбцов (без _df1/_df2)
+            df1_cols = [c[:-4] for c in row1_split.columns]
+            df2_cols = [c[:-4] for c in row2_split.columns]
+            row1_split.columns = df1_cols
+            row2_split.columns = df2_cols
+            
             if not row1_split.empty:
                 result_data = {}
                 for col in self.key_columns:
-                    result_data[col] = row1_split[col].values
+                    result_data[col] = diff_raw[col].values
                 for col in non_key_cols:
                     result_data[f"{col}_df1"] = row1_split[col].values
                     result_data[f"{col}_df2"] = row2_split[col].values
