@@ -359,9 +359,10 @@ class InMemoryComparator:
                 sample_data = df_temp[dup_mask].head(20)
                 
                 if not sample_data.empty:
+                    all_cols = list(self.schema.keys())
                     sample_dfs = []
                     for _, row in sample_data.iterrows():
-                        row_dict = {col: row[col] for col in self.key_columns}
+                        row_dict = {col: row[col] for col in all_cols}
                         sample_dfs.append(row_dict)
                     sample_df = pd.DataFrame(sample_dfs)
                     dup_samples.append((df_name, sample_df))

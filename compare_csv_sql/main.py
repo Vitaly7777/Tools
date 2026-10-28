@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QLabel, QTextEdit, QSpinBox,
     QGroupBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QProgressBar, QLineEdit, QComboBox,
-    QCheckBox, QDialog, QDialogButtonBox, QTextBrowser
+    QCheckBox, QDialog, QDialogButtonBox, QTextBrowser, QSizePolicy
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QTextCursor, QIcon, QAction, QColor
@@ -641,6 +641,7 @@ class MainWindow(QMainWindow):
         self.output_dir = Path("./tmp/Results/compare_csv").resolve()
         self.schema_manager = SchemaManager()
         self.key_uniqueness_warnings = []
+        self.key_uniqueness_samples = []  # образцы дубликатов для отображения во вкладке
         self.worker = None  # Сохраняем ссылку на worker для hotkeys и closeEvent
         self.max_display_rows = 10000  # Лимит отображения строк в UI
 
@@ -654,7 +655,7 @@ class MainWindow(QMainWindow):
 
     def init_ui(self):
         """Инициализация интерфейса"""
-        self.setWindowTitle("Сравнение DataFrame")
+        self.setWindowTitle("Сравнение CSV файлов")
         self.setMinimumSize(1400, 900)
 
         self._create_menu()
@@ -1314,6 +1315,11 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(table)
         
+        # Кнопка "Копировать в буфер"
+        copy_btn = QPushButton("📋 Копировать в буфер")
+        copy_btn.clicked.connect(lambda: self._copy_to_clipboard(duplicates_df))
+        layout.addWidget(copy_btn)
+        
         # Добавляем вкладку с дубликатами
         self.results_tabs.addTab(widget, f"⚠ {title}")
         self.results_tabs.setCurrentWidget(widget)
@@ -1745,6 +1751,7 @@ class MainWindow(QMainWindow):
         # --- КОНЕЦ АГРЕГАЦИИ ---
 
         self.key_uniqueness_warnings = []
+        self.key_uniqueness_samples = []
 
         # Настройка UI
         self.progress_bar.show()
@@ -1820,6 +1827,8 @@ class MainWindow(QMainWindow):
 
     def _on_duplicates_found(self, table_name: str, sample_df: pd.DataFrame):
         """Обработка найденных дубликатов из чанкового режима"""
+        # Сохраняем образцы для отображения во вкладке предупреждений
+        self.key_uniqueness_samples.append((table_name, sample_df))
         # Показываем дубликаты в вкладке результатов
         self._show_duplicates_table(sample_df, f"Дубликаты в {table_name}")
     
@@ -1832,7 +1841,8 @@ class MainWindow(QMainWindow):
         self._display_results()
 
         # Показываем предупреждения об уникальности (если были)
-        if self.key_uniqueness_warnings:
+        # При включённой агрегации popup не показываем — дубликаты будут агрегированы
+        if self.key_uniqueness_warnings and not self.agg_checkbox.isChecked():
             warning_text = "\n\n".join([msg for msg, _ in self.key_uniqueness_warnings])
             reply = QMessageBox.warning(
                 self, "Предупреждение о неуникальных ключах",
@@ -1958,18 +1968,56 @@ class MainWindow(QMainWindow):
             warning_widget = QWidget()
             warning_layout = QVBoxLayout(warning_widget)
             
-            for msg, details in self.key_uniqueness_warnings:
+            # Заголовки в одну строку
+            if len(self.key_uniqueness_warnings) > 1:
+                headers_layout = QHBoxLayout()
+            else:
+                headers_layout = QVBoxLayout()
+            
+            # Создаём горизонтальный layout для таблиц
+            if len(self.key_uniqueness_warnings) > 1:
+                tables_layout = QHBoxLayout()
+            else:
+                tables_layout = QVBoxLayout()
+            
+            for i, (msg, details) in enumerate(self.key_uniqueness_warnings):
                 warning_label = QLabel(f"⚠ {msg}")
                 warning_label.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
-                warning_layout.addWidget(warning_label)
+                headers_layout.addWidget(warning_label)
                 
-                details_edit = QTextEdit()
-                details_edit.setReadOnly(True)
-                details_edit.setText(details)
-                details_edit.setMaximumHeight(150)
-                font = QFont("Courier New", 9)
-                details_edit.setFont(font)
-                warning_layout.addWidget(details_edit)
+                # Показываем образцы дубликатов таблицей
+                if i < len(self.key_uniqueness_samples):
+                    sample_table_name, sample_df = self.key_uniqueness_samples[i]
+                    if sample_df is not None and not sample_df.empty:
+                        # Создаём виджет для каждой таблицы
+                        table_widget = QWidget()
+                        table_inner_layout = QVBoxLayout(table_widget)
+                        
+                        sample_table = QTableWidget()
+                        sample_table.setColumnCount(len(sample_df.columns))
+                        sample_table.setHorizontalHeaderLabels(sample_df.columns.tolist())
+                        sample_table.setRowCount(len(sample_df))
+                        
+                        for row_idx, (_, row) in enumerate(sample_df.iterrows()):
+                            for col_idx, col_name in enumerate(sample_df.columns):
+                                value = str(row[col_name]) if pd.notna(row[col_name]) else ""
+                                item = QTableWidgetItem(value)
+                                sample_table.setItem(row_idx, col_idx, item)
+                        
+                        header = sample_table.horizontalHeader()
+                        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+                        header.setStretchLastSection(True)
+                        table_inner_layout.addWidget(sample_table)
+                        
+                        # Кнопка копирования
+                        copy_btn = QPushButton("📋 Копировать в буфер")
+                        copy_btn.clicked.connect(lambda sd=sample_df: self._copy_to_clipboard(sd))
+                        table_inner_layout.addWidget(copy_btn)
+                        
+                        tables_layout.addWidget(table_widget)
+            
+            warning_layout.addLayout(headers_layout)
+            warning_layout.addLayout(tables_layout)
             
             self.results_tabs.addTab(warning_widget, f"⚠ Предупреждения ({len(self.key_uniqueness_warnings)})")
     
@@ -2016,6 +2064,15 @@ class MainWindow(QMainWindow):
         table.setColumnCount(len(display_df.columns))
         table.setHorizontalHeaderLabels(display_df.columns.tolist())
         table.setRowCount(len(display_df))
+        
+        # Ограничиваем размер таблицы чтобы не ломать layout при большом количестве строк
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        max_table_height = min(len(display_df) * 30 + 50, 600)
+        table.setMaximumHeight(max_table_height)
+        table.setMinimumHeight(max_table_height)
+        table.resize(table.width(), max_table_height)
+        table.updateGeometry()
+        QApplication.processEvents()
         
         # Определяем пары столбцов для сравнения (без суффиксов _df1 и _df2)
         column_pairs = []
@@ -2273,6 +2330,7 @@ class MainWindow(QMainWindow):
         self.df1 = None
         self.df2 = None
         self.key_uniqueness_warnings = []
+        self.key_uniqueness_samples = []
         self.results_tabs.clear()
         self.log_panel.clear()
         self.file1_path.clear()

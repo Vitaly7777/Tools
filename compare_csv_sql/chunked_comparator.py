@@ -167,9 +167,9 @@ class ChunkedComparator:
                                       usecols=all_cols,
                                       dtype=self.schema,
                                       chunksize=self.chunksize,
-                                      low_memory=False,
                                       encoding=self.encoding,
-                                      sep=self.sep):
+                                      sep=self.sep,
+                                      engine='python'):
                 current_chunk += 1
                 
                 # Оптимизация: один astype(str) вместо трёх
@@ -248,9 +248,10 @@ class ChunkedComparator:
         for _ in pd.read_csv(file_path,
                               usecols=all_cols,
                               chunksize=self.chunksize,
-                              low_memory=False,
+                            #   low_memory=False,
                               encoding=self.encoding,
-                              sep=self.sep):
+                              sep=self.sep,
+                              engine='python'):
             count += 1
         return max(1, count)
 
@@ -330,11 +331,19 @@ class ChunkedComparator:
                 sample_data = cursor.fetchall()
                 
                 if sample_data:
-                    # Парсим key_json для показа
+                    # Парсим key_json и row_json для показа всех столбцов
                     sample_dfs = []
+                    all_cols = list(self.schema.keys())
                     for key_json_val, row_json_val in sample_data:
                         keys = key_json_val.split(SEP)
-                        row_dict = dict(zip(self.key_columns, keys))
+                        row_values = row_json_val.split(SEP)
+                        key_dict = dict(zip(self.key_columns, keys))
+                        # Дополняем row_values до нужного количества столбцов
+                        while len(row_values) < len(all_cols):
+                            row_values.append('')
+                        row_dict = dict(zip(all_cols, row_values))
+                        # Объединяем ключевые столбцы (из key_json) и все столбцы (из row_json)
+                        row_dict.update(key_dict)
                         sample_dfs.append(row_dict)
                     sample_df = pd.DataFrame(sample_dfs)
                     dup_samples.append((table, sample_df))
@@ -444,6 +453,11 @@ class ChunkedComparator:
             if non_numeric_cols:
                 self._log(f"  Строковые столбцы (первое значение): {', '.join(non_numeric_cols)}")
             
+            # Конвертируем числовые столбцы в float перед агрегацией
+            # (данные хранятся как строки в SQLite, pandas не может агрегировать строки)
+            for col in numeric_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
             agg_dict = {col: agg_func for col in numeric_cols}
             for col in non_numeric_cols:
                 agg_dict[col] = 'first'
@@ -453,6 +467,12 @@ class ChunkedComparator:
                 df_agg = df.groupby(self.key_columns, as_index=False).agg(agg_dict)
             else:
                 df_agg = df.drop_duplicates(subset=self.key_columns, keep='first')
+            
+            # После groupby().agg() числовые столбцы стали float — конвертируем обратно в str
+            # для совместимости с последующим форматированием и вставкой в SQLite
+            for col in numeric_cols:
+                if col in df_agg.columns:
+                    df_agg[col] = df_agg[col].apply(lambda x: '' if pd.isna(x) else str(float(x)))
             
             rows_after = len(df_agg)
             duplicates_removed = rows_before - rows_after
@@ -514,6 +534,103 @@ class ChunkedComparator:
         self._saved_files.append(filepath)
         return filepath
 
+    def _expand_csv_columns(self, filename: str, mode: str = 'only'):
+        """Раскрывает key_json/row_json в отдельные столбцы схемы в сохранённом CSV.
+        
+        Args:
+            filename: имя файла в self._temp_dir
+            mode: 'only' — split row_json -> all_cols;
+                  'diff' — split row1/row2 -> all_cols_df1/all_cols_df2
+        """
+        filepath = os.path.join(self._temp_dir, filename)
+        if not os.path.exists(filepath):
+            return
+        
+        all_cols = list(self.schema.keys())
+        df = pd.read_csv(filepath, encoding='utf-8-sig')
+        
+        if mode == 'only':
+            # row_json -> all_cols
+            split_cols = df['row_json'].str.split(SEP, n=-1, expand=True)
+            # str.split(expand=True) может вернуть 0 столбцов если row_json пустой
+            if split_cols.empty and len(all_cols) > 0:
+                split_cols = pd.DataFrame(columns=all_cols)
+            elif split_cols.shape[1] != len(all_cols):
+                # Дополняем или обрезаем столбцы до ожидаемого количества
+                if split_cols.shape[1] < len(all_cols):
+                    for i in range(split_cols.shape[1], len(all_cols)):
+                        split_cols[i] = ''
+                split_cols = split_cols.iloc[:, :len(all_cols)]
+                split_cols.columns = all_cols
+            else:
+                split_cols.columns = all_cols
+            key_cols_df = df[['key_json']].copy()
+            # Раскрываем key_json -> key_columns
+            key_split = key_cols_df['key_json'].str.split(SEP, n=-1, expand=True)
+            if key_split.shape[1] != len(self.key_columns):
+                if key_split.empty and len(self.key_columns) > 0:
+                    key_split = pd.DataFrame(columns=self.key_columns)
+                elif key_split.shape[1] < len(self.key_columns):
+                    for i in range(key_split.shape[1], len(self.key_columns)):
+                        key_split[i] = ''
+                key_split = key_split.iloc[:, :len(self.key_columns)]
+                key_split.columns = self.key_columns
+            expanded = pd.concat([key_split, split_cols], axis=1)
+            expanded.to_csv(filepath, index=False, encoding='utf-8-sig')
+            
+        elif mode == 'diff':
+            # key_json + row1/row2 -> key_cols + all_cols_df1/all_cols_df2
+            key_cols_df = df[['key_json']].copy()
+            key_split = key_cols_df['key_json'].str.split(SEP, n=-1, expand=True)
+            if key_split.shape[1] != len(self.key_columns):
+                if key_split.empty and len(self.key_columns) > 0:
+                    key_split = pd.DataFrame(columns=self.key_columns)
+                elif key_split.shape[1] < len(self.key_columns):
+                    for i in range(key_split.shape[1], len(self.key_columns)):
+                        key_split[i] = ''
+                key_split = key_split.iloc[:, :len(self.key_columns)]
+                key_split.columns = self.key_columns
+            
+            row1_split = df['row1'].str.split(SEP, n=-1, expand=True)
+            df1_cols = [f"{col}_df1" for col in all_cols]
+            if row1_split.shape[1] != len(all_cols):
+                if row1_split.empty and len(all_cols) > 0:
+                    row1_split = pd.DataFrame(columns=df1_cols)
+                elif row1_split.shape[1] < len(all_cols):
+                    for i in range(row1_split.shape[1], len(all_cols)):
+                        row1_split[i] = ''
+                row1_split = row1_split.iloc[:, :len(all_cols)]
+                row1_split.columns = df1_cols
+            else:
+                row1_split.columns = df1_cols
+            
+            row2_split = df['row2'].str.split(SEP, n=-1, expand=True)
+            df2_cols = [f"{col}_df2" for col in all_cols]
+            if row2_split.shape[1] != len(all_cols):
+                if row2_split.empty and len(all_cols) > 0:
+                    row2_split = pd.DataFrame(columns=df2_cols)
+                elif row2_split.shape[1] < len(all_cols):
+                    for i in range(row2_split.shape[1], len(all_cols)):
+                        row2_split[i] = ''
+                row2_split = row2_split.iloc[:, :len(all_cols)]
+                row2_split.columns = df2_cols
+            else:
+                row2_split.columns = df2_cols
+            
+            # Собираем столбцы в правильном порядке: key + попарно col_df1, col_df2
+            # (как в режиме памяти)
+            ordered_cols = list(key_split.columns)
+            for col in all_cols:
+                df1_col = f"{col}_df1"
+                df2_col = f"{col}_df2"
+                if df1_col in row1_split.columns:
+                    ordered_cols.append(df1_col)
+                if df2_col in row2_split.columns:
+                    ordered_cols.append(df2_col)
+            
+            expanded = pd.concat([key_split, row1_split, row2_split], axis=1)[ordered_cols]
+            expanded.to_csv(filepath, index=False, encoding='utf-8-sig')
+
     def _get_display_df(self, query: str, columns: List[str], limit: int) -> pd.DataFrame:
         """Загружает только первые limit строк из запроса."""
         limited_query = f"{query} LIMIT {limit}"
@@ -531,6 +648,7 @@ class ChunkedComparator:
             WHERE b.key_hash IS NULL
         '''
         self._save_full_result_to_csv(query_only1, ['key_json', 'row_json'], 'df1_only.csv')
+        self._expand_csv_columns('df1_only.csv', mode='only')
         
         # Получаем реальное количество строк для определения усечения
         cursor = self.conn.cursor()
@@ -558,6 +676,7 @@ class ChunkedComparator:
             WHERE b.key_hash IS NULL
         '''
         self._save_full_result_to_csv(query_only2, ['key_json', 'row_json'], 'df2_only.csv')
+        self._expand_csv_columns('df2_only.csv', mode='only')
         
         cursor = self.conn.cursor()
         cursor.execute(query_only2.replace('SELECT a.key_json, a.row_json', 'SELECT COUNT(*)'))
@@ -583,6 +702,7 @@ class ChunkedComparator:
             WHERE a.row_json != b.row_json
         '''
         self._save_full_result_to_csv(query_diff, ['key_json', 'row1', 'row2'], 'differences.csv')
+        self._expand_csv_columns('differences.csv', mode='diff')
         
         cursor = self.conn.cursor()
         cursor.execute(query_diff.replace('SELECT a.key_json, a.row_json AS row1, b.row_json AS row2', 'SELECT COUNT(*)'))
