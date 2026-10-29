@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QLabel, QTextEdit, QSpinBox,
     QGroupBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QProgressBar, QLineEdit, QComboBox,
-    QCheckBox, QDialog, QDialogButtonBox, QTextBrowser, QSizePolicy
+    QCheckBox, QDialog, QDialogButtonBox, QTextBrowser, QSizePolicy,
+    QScrollArea 
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QTextCursor, QIcon, QAction, QColor
@@ -667,7 +668,7 @@ class MainWindow(QMainWindow):
         self.key_uniqueness_warnings = []
         self.key_uniqueness_samples = []  # образцы дубликатов для отображения во вкладке
         self.worker = None  # Сохраняем ссылку на worker для hotkeys и closeEvent
-        self.max_display_rows = 10000  # Лимит отображения строк в UI
+        self.default_max_display_rows = 10000  # Лимит отображения строк в UI по умолчанию
 
         self.init_ui()
         self._load_schema_list()
@@ -691,14 +692,29 @@ class MainWindow(QMainWindow):
         top_panel = QWidget()
         top_layout = QVBoxLayout(top_panel)
 
+        # file_panel = self._create_file_panel()
+        # file_panel.setMaximumHeight(250)  # Фиксированная высота панели файлов
+        # top_layout.addWidget(file_panel)
+
+        # settings_panel = self._create_settings_panel()
+        # top_layout.addWidget(settings_panel)
+
+        # main_layout.addWidget(top_panel)
+
         file_panel = self._create_file_panel()
-        file_panel.setMaximumHeight(250)  # Фиксированная высота панели файлов
         top_layout.addWidget(file_panel)
 
         settings_panel = self._create_settings_panel()
         top_layout.addWidget(settings_panel)
 
-        main_layout.addWidget(top_panel)
+        # Оборачиваем верхнюю панель в QScrollArea, чтобы при нехватке
+        # вертикального места появлялся скролл, а не обрезались кнопки
+        top_scroll = QScrollArea()
+        top_scroll.setWidgetResizable(True)
+        top_scroll.setWidget(top_panel)
+        top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        top_scroll.setMaximumHeight(450)  # ограничение на область прокрутки
+        main_layout.addWidget(top_scroll)
 
         splitter = QSplitter(Qt.Vertical)
 
@@ -720,8 +736,47 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)  # log_panel не растягивается
         splitter.setStretchFactor(1, 1)  # results_tabs занимает всё остальное
         
-        # Фиксируем размеры верхней панели
-        top_panel.setMaximumHeight(400)  # Максимальная высота верхней панели
+        # # Фиксируем размеры верхней панели
+        # top_panel.setMaximumHeight(400)  # Максимальная высота верхней панели
+
+        # Нижняя панель с кнопками управления (за пределами прокручиваемой области)
+        bottom_panel = QWidget()
+        bottom_layout = QHBoxLayout(bottom_panel)
+        
+        # Кнопка проверки уникальности — слева
+        self.check_uniqueness_btn = QPushButton("Проверить уникальность ключей")
+        self.check_uniqueness_btn.clicked.connect(self._check_key_uniqueness_manual)
+        self.check_uniqueness_btn.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold;")
+        self.check_uniqueness_btn.setMaximumWidth(300)
+        bottom_layout.addWidget(self.check_uniqueness_btn)
+        
+        bottom_layout.addStretch()
+        
+        # Кнопки управления — справа
+        btn_load = QPushButton("1. Загрузить файлы")
+        btn_load.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        btn_load.setMaximumWidth(200)
+        btn_load.clicked.connect(self._load_files)
+        bottom_layout.addWidget(btn_load)
+        
+        self.btn_compare = QPushButton("2. Сравнить!")
+        self.btn_compare.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; font-size: 14px;")
+        self.btn_compare.setMaximumWidth(200)
+        self.btn_compare.clicked.connect(self._start_comparison)
+        bottom_layout.addWidget(self.btn_compare)
+        
+        self.btn_save = QPushButton("3. Сохранить результаты")
+        self.btn_save.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self.btn_save.setMaximumWidth(200)
+        self.btn_save.clicked.connect(self._save_results)
+        bottom_layout.addWidget(self.btn_save)
+        
+        btn_clear = QPushButton("Очистить все")
+        btn_clear.setMaximumWidth(200)
+        btn_clear.clicked.connect(self._clear_all)
+        bottom_layout.addWidget(btn_clear)
+        
+        main_layout.addWidget(bottom_panel)
 
         self.status_bar = self.statusBar()
         self.progress_bar = QProgressBar()
@@ -1038,40 +1093,22 @@ class MainWindow(QMainWindow):
         agg_layout.addStretch()
         params_layout.addLayout(agg_layout)
 
-        # Кнопка проверки уникальности (без изменений)
-        check_uniqueness_btn = QPushButton("Проверить уникальность ключей")
-        check_uniqueness_btn.clicked.connect(self._check_key_uniqueness_manual)
-        check_uniqueness_btn.setStyleSheet("background-color: #9C27B0; color: white;")
-        params_layout.addWidget(check_uniqueness_btn)
+        # ----- НОВЫЙ БЛОК: ЛИМИТ ОТОБРАЖАЕМЫХ СТРОК -----
+        display_rows_layout = QHBoxLayout()
+        display_rows_layout.addWidget(QLabel("Лимит строк результатов:"))
+        self.max_display_rows_spin = QSpinBox()
+        self.max_display_rows_spin.setRange(100, 100000)
+        self.max_display_rows_spin.setValue(10000)
+        self.max_display_rows_spin.setSingleStep(1000)
+        self.max_display_rows_spin.setSuffix(" строк")
+        display_rows_layout.addWidget(self.max_display_rows_spin)
+        btn_reset_display_rows = QPushButton("Сброс (10K)")
+        btn_reset_display_rows.clicked.connect(lambda: self.max_display_rows_spin.setValue(10000))
+        display_rows_layout.addWidget(btn_reset_display_rows)
+        params_layout.addLayout(display_rows_layout)
+        # ----- КОНЕЦ НОВОГО БЛОКА -----
 
-        params_layout.addWidget(QLabel(""))
-
-        # Кнопки управления (без изменений)
-        control_buttons = QVBoxLayout()
-        btn_load = QPushButton("1. Загрузить файлы")
-        btn_load.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
-        btn_load.setMaximumWidth(200)
-        btn_load.clicked.connect(self._load_files)
-        control_buttons.addWidget(btn_load)
-
-        self.btn_compare = QPushButton("2. Сравнить!")
-        self.btn_compare.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; font-size: 14px;")
-        self.btn_compare.setMaximumWidth(200)
-        self.btn_compare.clicked.connect(self._start_comparison)
-        control_buttons.addWidget(self.btn_compare)
-
-        self.btn_save = QPushButton("3. Сохранить результаты")
-        self.btn_save.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
-        self.btn_save.setMaximumWidth(200)
-        self.btn_save.clicked.connect(self._save_results)
-        control_buttons.addWidget(self.btn_save)
-
-        btn_clear = QPushButton("Очистить все")
-        btn_clear.setMaximumWidth(200)
-        btn_clear.clicked.connect(self._clear_all)
-        control_buttons.addWidget(btn_clear)
-
-        params_layout.addLayout(control_buttons)
+        params_layout.addStretch()
 
         # Обёртка QVBoxLayout в QWidget для QHBoxLayout
         params_widget = QWidget()
@@ -1989,7 +2026,8 @@ class MainWindow(QMainWindow):
         
         # Таблица "Только в df1"
         if not df1_only_full.empty:
-            tab1 = self._create_table_widget(df1_only_full, show_all=False)
+            # Во всех режимах ограничиваем видимые строки до 3, остальное скроллом
+            tab1 = self._create_table_widget(df1_only_full, show_all=True, max_visible_rows=3)
             tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df1_only else ""
             self.results_tabs.addTab(tab1, f"{tab_title}Только в df1 ({total_df1_only})")
         else:
@@ -2000,7 +2038,8 @@ class MainWindow(QMainWindow):
         
         # Таблица "Только в df2"
         if not df2_only_full.empty:
-            tab2 = self._create_table_widget(df2_only_full, show_all=False)
+            # Во всех режимах ограничиваем видимые строки до 3, остальное скроллом
+            tab2 = self._create_table_widget(df2_only_full, show_all=True, max_visible_rows=3)
             tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df2_only else ""
             self.results_tabs.addTab(tab2, f"{tab_title}Только в df2 ({total_df2_only})")
         else:
@@ -2015,7 +2054,8 @@ class MainWindow(QMainWindow):
                 # В чанковом режиме: все данные, но видно только 3 строки, остальное скроллом
                 tab3 = self._create_table_widget(diff_full, show_all=True, max_visible_rows=3)
             else:
-                tab3 = self._create_table_widget(diff_full, show_all=False)
+                # В in-memory режиме: также ограничиваем видимые строки до 3
+                tab3 = self._create_table_widget(diff_full, show_all=True, max_visible_rows=3)
             tab_title = f"⚠ " if is_chunked and self.comparator._truncated_df1_df2_value else ""
             self.results_tabs.addTab(tab3, f"{tab_title}Различия ({total_diff})")
         else:
@@ -2088,30 +2128,26 @@ class MainWindow(QMainWindow):
         
         Args:
             df: DataFrame для отображения
-            max_display_rows: лимит отображения строк (по умолчанию self.max_display_rows)
+            max_display_rows: лимит отображения строк (по умолчанию self.max_display_rows = 10000)
             info_text_override: если задан, заменяет автоматический info label
-            show_all: если True — показывать все строки (для чанкового режима)
+            show_all: если True — не показывать предупреждение об усечении (но лимит всё равно применяется)
             max_visible_rows: если задан, ограничивает видимую высоту таблицы (остальное скроллом)
         """
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
-        # Применяем лимит отображения (in-memory режим)
-        # В chunked-режиме с show_all=True — показываем все строки
+        # Применяем лимит отображения (ограничение количества строк)
         if max_display_rows is None:
-            max_display_rows = self.max_display_rows
+            max_display_rows = self.max_display_rows_spin.value()
         
-        if show_all:
-            display_df = df
-            total_rows = len(df)
-        else:
-            total_rows = len(df)
-            display_df = df.head(max_display_rows) if len(df) > max_display_rows else df
+        # Ограничиваем количество строк для отображения во всех режимах
+        total_rows = len(df)
+        display_df = df.head(max_display_rows) if len(df) > max_display_rows else df
         
         # Информация о таблице
         if info_text_override:
             info_label = QLabel(info_text_override)
-        elif not show_all and total_rows > max_display_rows:
+        elif total_rows > max_display_rows:
             info_label = QLabel(
                 f"Показаны первые {len(display_df)} из {total_rows} строк, "
                 f"Столбцов: {len(df.columns)}"
@@ -2442,6 +2478,7 @@ class MainWindow(QMainWindow):
                 sep_auto = data.get('sep_auto', False)
                 chunked = data.get('chunked', False)
                 chunksize = data.get('chunksize', 50000)
+                max_display_rows = data.get('max_display_rows', 10000)
                 agg = data.get('agg', False)
                 agg_func = data.get('agg_func', 'sum')
                 tolerance = data.get('tolerance', 0)
@@ -2468,6 +2505,10 @@ class MainWindow(QMainWindow):
                 self.chunked_checkbox.setChecked(chunked)
                 self.chunksize_spin.setValue(chunksize)
                 
+                # Восстанавливаем лимит отображения строк
+                if 100 <= max_display_rows <= 100000:
+                    self.max_display_rows_spin.setValue(max_display_rows)
+                
                 # Восстанавливаем агрегацию
                 self.agg_checkbox.setChecked(agg)
                 if agg_func in ["sum", "mean", "min", "max"]:
@@ -2492,6 +2533,7 @@ class MainWindow(QMainWindow):
                 'sep_auto': self.sep_auto_checkbox.isChecked(),
                 'chunked': self.chunked_checkbox.isChecked(),
                 'chunksize': self.chunksize_spin.value(),
+                'max_display_rows': self.max_display_rows_spin.value(),
                 'agg': self.agg_checkbox.isChecked(),
                 'agg_func': self.agg_func_combo.currentText(),
                 'tolerance': self.tolerance_spin.value()

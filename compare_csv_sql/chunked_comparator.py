@@ -554,76 +554,55 @@ class ChunkedComparator:
         all_cols = list(self.schema.keys())
         df = pd.read_csv(filepath, encoding='utf-8-sig')
         
+        def _split_and_align(series, expected_cols):
+            """Раскрывает серию строк через SEP и выравнивает столбцы до expected_cols."""
+            if series.empty:
+                return pd.DataFrame(columns=expected_cols)
+            
+            # Раскрываем строки
+            split_df = series.str.split(SEP, n=-1, expand=True)
+            
+            # Если split вернул 0 столбцов (все значения пустые)
+            if split_df.shape[1] == 0:
+                return pd.DataFrame(columns=expected_cols)
+            
+            # Обрезаем или дополняем до expected_cols
+            n_cols = split_df.shape[1]
+            if n_cols < len(expected_cols):
+                # Дополняем пустыми столбцами
+                for i in range(n_cols, len(expected_cols)):
+                    split_df[i] = ''
+            # Обрезаем лишние столбцы
+            split_df = split_df.iloc[:, :len(expected_cols)]
+            
+            # Присваиваем правильные имена столбцов
+            split_df.columns = expected_cols
+            
+            return split_df
+        
         if mode == 'only':
             # row_json -> all_cols
-            split_cols = df['row_json'].str.split(SEP, n=-1, expand=True)
-            # str.split(expand=True) может вернуть 0 столбцов если row_json пустой
-            if split_cols.empty and len(all_cols) > 0:
-                split_cols = pd.DataFrame(columns=all_cols)
-            elif split_cols.shape[1] != len(all_cols):
-                # Дополняем или обрезаем столбцы до ожидаемого количества
-                if split_cols.shape[1] < len(all_cols):
-                    for i in range(split_cols.shape[1], len(all_cols)):
-                        split_cols[i] = ''
-                split_cols = split_cols.iloc[:, :len(all_cols)]
-                split_cols.columns = all_cols
-            else:
-                split_cols.columns = all_cols
-            key_cols_df = df[['key_json']].copy()
-            # Раскрываем key_json -> key_columns
-            key_split = key_cols_df['key_json'].str.split(SEP, n=-1, expand=True)
-            if key_split.shape[1] != len(self.key_columns):
-                if key_split.empty and len(self.key_columns) > 0:
-                    key_split = pd.DataFrame(columns=self.key_columns)
-                elif key_split.shape[1] < len(self.key_columns):
-                    for i in range(key_split.shape[1], len(self.key_columns)):
-                        key_split[i] = ''
-                key_split = key_split.iloc[:, :len(self.key_columns)]
-                key_split.columns = self.key_columns
+            split_cols = _split_and_align(df['row_json'], all_cols)
+            
+            # key_json -> key_columns
+            key_split = _split_and_align(df['key_json'], self.key_columns)
+            
             expanded = pd.concat([key_split, split_cols], axis=1)
             expanded.to_csv(filepath, index=False, encoding='utf-8-sig')
             
         elif mode == 'diff':
-            # key_json + row1/row2 -> key_cols + all_cols_df1/all_cols_df2
-            key_cols_df = df[['key_json']].copy()
-            key_split = key_cols_df['key_json'].str.split(SEP, n=-1, expand=True)
-            if key_split.shape[1] != len(self.key_columns):
-                if key_split.empty and len(self.key_columns) > 0:
-                    key_split = pd.DataFrame(columns=self.key_columns)
-                elif key_split.shape[1] < len(self.key_columns):
-                    for i in range(key_split.shape[1], len(self.key_columns)):
-                        key_split[i] = ''
-                key_split = key_split.iloc[:, :len(self.key_columns)]
-                key_split.columns = self.key_columns
+            # key_json -> key_columns
+            key_split = _split_and_align(df['key_json'], self.key_columns)
             
-            row1_split = df['row1'].str.split(SEP, n=-1, expand=True)
+            # row1 -> all_cols_df1
             df1_cols = [f"{col}_df1" for col in all_cols]
-            if row1_split.shape[1] != len(all_cols):
-                if row1_split.empty and len(all_cols) > 0:
-                    row1_split = pd.DataFrame(columns=df1_cols)
-                elif row1_split.shape[1] < len(all_cols):
-                    for i in range(row1_split.shape[1], len(all_cols)):
-                        row1_split[i] = ''
-                row1_split = row1_split.iloc[:, :len(all_cols)]
-                row1_split.columns = df1_cols
-            else:
-                row1_split.columns = df1_cols
+            row1_split = _split_and_align(df['row1'], df1_cols)
             
-            row2_split = df['row2'].str.split(SEP, n=-1, expand=True)
+            # row2 -> all_cols_df2
             df2_cols = [f"{col}_df2" for col in all_cols]
-            if row2_split.shape[1] != len(all_cols):
-                if row2_split.empty and len(all_cols) > 0:
-                    row2_split = pd.DataFrame(columns=df2_cols)
-                elif row2_split.shape[1] < len(all_cols):
-                    for i in range(row2_split.shape[1], len(all_cols)):
-                        row2_split[i] = ''
-                row2_split = row2_split.iloc[:, :len(all_cols)]
-                row2_split.columns = df2_cols
-            else:
-                row2_split.columns = df2_cols
+            row2_split = _split_and_align(df['row2'], df2_cols)
             
             # Собираем столбцы в правильном порядке: key + попарно col_df1, col_df2
-            # (как в режиме памяти)
             ordered_cols = list(key_split.columns)
             for col in all_cols:
                 df1_col = f"{col}_df1"
